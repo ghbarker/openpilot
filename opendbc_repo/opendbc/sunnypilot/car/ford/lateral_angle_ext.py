@@ -130,13 +130,10 @@ _PSCM_SAT_UNWIND_RATE = 0.02        # rad/call (0.02 * 20Hz = 0.40 rad/s)
 # panda-clean wire pattern the human-turn override sends, no ford.h involvement -- resets the
 # PSCM's authority, after which path_angle ramps back in from zero through the soft ROC.
 #
-# Drift branch (2026-07-20): three logged interventions on the same route showed the detector
-# missed the mirror case entirely -- hands-off, desired curvature flat/near-zero while *measured*
-# curvature grew on its own (car curving when the model wanted straight), twice, because the trigger
-# required abs(desired) > abs(current). That's backwards from the classic stall this was built for,
-# so it never armed until the driver had already corrected. The detection below now has a second,
-# deliberately narrow branch for exactly that case (measured leads AND the model wants ~straight);
-# see the in-line comment at the detection site for why it is not simply direction-agnostic.
+# The mirror case -- hands-off, desired ~straight while *measured* curvature grows on its own (the
+# car curving when the model wants straight) -- is deliberately NOT handled by this blip. A drift
+# branch for it was built, road-tested 2026-07-20, and reverted: cutting the command for 300 ms
+# during an active drift made the drift worse, not better (see the comment at the detection site).
 _STEER_DT = CarControllerParams.STEER_STEP * DT_CTRL  # 20 Hz lateral tick (matches human_turn.py)
 _STALL_GAP_MIN = 2.0 * CarControllerParams.CURVATURE_ERROR  # desired/measured must diverge by 2x the clip tolerance
 # A stall is a FRACTIONAL failure, not just an absolute gap: during an honest deep-curve
@@ -607,26 +604,25 @@ class LateralAngleExt:
     # accumulator rather than resetting it; a closed gap or driver press ends the episode.
     self.stall_blip_cooldown_s = max(0.0, self.stall_blip_cooldown_s - _STEER_DT)
     _stall_gap = desired_curvature - current_curvature
-    # Two stall directions (see module docstring):
-    #   classic -- "car won't turn enough": the car is delivering under _STALL_DELIVERY_FRACTION of
-    #              the demand. Fractional, not just desired-leads-measured: an honest deep-curve
-    #              entry transient (0.7-0.85x of a large, fast-rising demand) clears the absolute
-    #              gap threshold on magnitude alone, and a mode-0 pulse mid-curve releases steering
-    #              exactly when the car is already behind (upstream PR #148's on-road evidence).
-    #   drift   -- "car turns when it shouldn't": measured leads while the model wants ~straight.
-    # The drift branch is deliberately narrow: it also requires |desired| to be inside the deviation
-    # clip's own noise band, i.e. the model is genuinely commanding near-straight. Without that guard,
-    # "measured leads desired" also matches normal curve EXITS (planner unwinds ahead of the car, both
-    # values still large) -- offline replay of the incident route showed the unguarded version firing
-    # 4-6 extra blips per minute in curve-rich stretches, and a 300 ms mode-0 gap mid-exit is itself a
-    # hazard. With the guard, replay fires exactly one extra blip per logged drift incident, ~1.4 s
-    # before the driver had to intervene, and none during curve entries/exits.
-    _stalled_classic = abs(current_curvature) < _STALL_DELIVERY_FRACTION * abs(desired_curvature)
-    _stalled_drift = (abs(desired_curvature) <= abs(current_curvature)
-                      and abs(desired_curvature) < 1.5 * CarControllerParams.CURVATURE_ERROR)
+    # Classic direction only -- "car won't turn enough": the car is delivering under
+    # _STALL_DELIVERY_FRACTION of the demand. Fractional, not just desired-leads-measured: an honest
+    # deep-curve entry transient (0.7-0.85x of a large, fast-rising demand) clears the absolute gap
+    # threshold on magnitude alone, and a mode-0 pulse mid-curve releases steering exactly when the
+    # car is already behind (upstream PR #148's on-road evidence).
+    #
+    # A "drift" branch (fire when measured leads a near-straight desired -- car curving when the
+    # model wants straight) was tried and REVERTED after road test 2026-07-20 (route
+    # bfef784d32f5351d/00000003--b73f9b9ea8 seg 2, t=165-168s): the blip fired exactly as designed
+    # on a genuine hands-off drift, and the drift then got WORSE for 1.6 s (actual curvature
+    # -0.002 -> -0.0067 against desired +0.012) until the driver corrected. The blip removes what
+    # little counter-command exists for 300 ms during an ACTIVE drift, and the ramp-back from zero
+    # takes longer still -- structurally wrong medicine unless the drift is PSCM attenuation, which
+    # that sample showed it is not. Do not re-add detection-triggered mode-0 pulses for the drift
+    # case; the drift root cause (deviation clip pinning the command to a drifting measurement)
+    # needs a fix that keeps commanding, not one that stops commanding.
     _stalled = (not CS.out.steeringPressed and not self.lane_change and v_ego > 9.0
                 and abs(_stall_gap) > _STALL_GAP_MIN
-                and (_stalled_classic or _stalled_drift))
+                and abs(current_curvature) < _STALL_DELIVERY_FRACTION * abs(desired_curvature))
     if _stalled:
       if self.bp_curvature_deviation_limited and self.stall_blip_cooldown_s <= 0.0:
         self.stall_blip_hold_s += _STEER_DT
