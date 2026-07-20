@@ -169,6 +169,104 @@ class TestStallDriftCaseStaysUntriggered(unittest.TestCase):
     self.assertEqual(ext.stall_blip_hold_s, 0.0)
 
 
+class TestBlipStormBreaker(unittest.TestCase):
+  """After _BLIP_STORM_COUNT firings inside the window, no path may fire until the lockout ends.
+
+  Pins the fix for the 2026-07-20 storm (13 blips / 46 s while the driver fought the wheel).
+  """
+
+  def _press_release_cycle(self, ext, CP, cs_press, cs_straight, frames_press=14, frames_idle=50):
+    for _ in range(frames_press):
+      ext.update_angle_strategy(_CC(latActive=True), cs_press, _Actuators(curvature=0.0), CP)
+    fired_before = len(ext.blip_recent_ages)
+    for _ in range(frames_idle):
+      ext.update_angle_strategy(_CC(latActive=True), cs_straight, _Actuators(curvature=0.0), CP)
+    return len(ext.blip_recent_ages) > fired_before or ext.blip_lockout_s > 0.0
+
+  def test_lockout_engages_and_blocks(self):
+    ext, CP = _harness()
+    cs_press = _CS(vEgoRaw=12.0, vEgo=12.0, steeringPressed=True, yawRate=0.0)
+    cs_straight = _CS(vEgoRaw=12.0, vEgo=12.0, steeringPressed=False, yawRate=0.0)
+    # three press/release cycles -> three hand-off pulses -> lockout engaged
+    for _ in range(3):
+      self._press_release_cycle(ext, CP, cs_press, cs_straight)
+    self.assertGreater(ext.blip_lockout_s, 0.0)
+    # fourth cycle: no new firing while locked out
+    fired = len(ext.blip_recent_ages)
+    for _ in range(14):
+      ext.update_angle_strategy(_CC(latActive=True), cs_press, _Actuators(curvature=0.0), CP)
+    ext.update_angle_strategy(_CC(latActive=True), cs_straight, _Actuators(curvature=0.0), CP)
+    self.assertEqual(len(ext.blip_recent_ages), fired)
+    self.assertFalse(ext.angle_stall_blip_active)
+
+
+class TestHandoffStraightnessGate(unittest.TestCase):
+  """The hand-off pulse must only fire when both command and measured curvature are near-straight.
+
+  Its own design comment always said "while the car is straight and the command is small";
+  the 2026-07-20 storm showed it firing mid-correction at measured 0.006-0.007.
+  """
+
+  def _press_then_release(self, desired, measured, v_ego=12.0):
+    ext, CP = _harness()
+    cs_press = _CS(vEgoRaw=v_ego, vEgo=v_ego, steeringPressed=True, yawRate=-measured * v_ego)
+    cs_rel = _CS(vEgoRaw=v_ego, vEgo=v_ego, steeringPressed=False, yawRate=-measured * v_ego)
+    for _ in range(14):  # 0.7 s press > _PRESS_BLIP_MIN_S
+      ext.update_angle_strategy(_CC(latActive=True), cs_press, _Actuators(curvature=desired), CP)
+    ext.update_angle_strategy(_CC(latActive=True), cs_rel, _Actuators(curvature=desired), CP)
+    return ext
+
+  def test_straight_release_fires(self):
+    ext = self._press_then_release(desired=0.0, measured=0.0)
+    self.assertTrue(ext.angle_stall_blip_active or ext.stall_blip_frames_left > 0)
+
+  def test_curving_release_does_not_fire(self):
+    ext = self._press_then_release(desired=0.0, measured=0.006)
+    self.assertFalse(ext.angle_stall_blip_active)
+    self.assertEqual(ext.stall_blip_frames_left, 0)
+
+  def test_commanded_curve_release_does_not_fire(self):
+    ext = self._press_then_release(desired=0.008, measured=0.0)
+    self.assertFalse(ext.angle_stall_blip_active)
+    self.assertEqual(ext.stall_blip_frames_left, 0)
+
+
+class TestPinningCompensation(unittest.TestCase):
+  """The portion of the model's command discarded by the deviation clip must keep pulling
+  path_angle toward the model's line -- bounded, filtered, and path_angle-only."""
+
+  def _drive(self, desired, measured, frames=40, v_ego=12.0):
+    ext, CP = _harness()
+    cs = _CS(vEgoRaw=v_ego, vEgo=v_ego, yawRate=-measured * v_ego)
+    result = None
+    for _ in range(frames):
+      result = ext.update_angle_strategy(_CC(latActive=True), cs, _Actuators(curvature=desired), CP)
+    return ext, result
+
+  def test_counters_drift_toward_model(self):
+    # model wants straight, car drifting: compensation must pull opposite the drift
+    ext, _ = self._drive(desired=0.0, measured=-0.006)
+    # excess = 0 - (measured + err) = +0.004 -> positive (leftward) correction against the drift
+    self.assertGreater(ext.pinning_comp_kappa, 0.002)
+    self.assertLessEqual(abs(ext.pinning_comp_kappa), 0.004 + 1e-9)
+
+  def test_shadow_stays_clipped(self):
+    # the compensation must never leak into the shadow the panda checks
+    ext, _ = self._drive(desired=0.0, measured=-0.006)
+    measured = -0.006
+    self.assertAlmostEqual(ext.bp_kappa_cmd, measured + CarControllerParams.CURVATURE_ERROR, places=6)
+
+  def test_zero_when_tracking(self):
+    # harness has no model data, so the blend halves the planner request (b=0.5):
+    # requested = desired * 0.5. True tracking = measured equals the blended request.
+    ext, _ = self._drive(desired=0.005, measured=0.0025)
+    self.assertLess(abs(ext.pinning_comp_kappa), 1e-6)
+
+  def test_inactive_below_clip_speed(self):
+    ext, _ = self._drive(desired=0.0, measured=-0.006, v_ego=7.0)
+    self.assertLess(abs(ext.pinning_comp_kappa), 1e-6)
+
+
 class TestShadowCurvaturePublishing(unittest.TestCase):
   V_EGO = 15.0
   YAW_RATE = 0.75  # rad/s -> measured curvature = -0.75 / 15 = -0.05 (OP convention)

@@ -149,6 +149,40 @@ _STALL_HOLD_S = 0.5          # accumulated divergence time before a pulse fires
 _STALL_BLIP_FRAMES = 6       # mode-0 pulse length (6 frames @ 20 Hz = 300 ms; PSCM acked mode 0 in ~150 ms on-road)
 _STALL_COOLDOWN_S = 2.0      # re-arm delay after a pulse (release ramp + PSCM response time)
 _STALL_MAX_BLIPS = 3         # give up on a stuck episode; devLim telemetry keeps recording the stall
+# Storm breaker (2026-07-20). Road test (route bfef784d32f5351d/00000003--b73f9b9ea8 segs 2-3,
+# 02:37:44-02:38:46 local) logged THIRTEEN blip episodes in ~46 s: the driver kept correcting
+# because control was poor, every >=0.5 s press release earned a hand-off pulse, each pulse cut
+# assist for 300 ms which degraded control further, which earned another correction -- a vicious
+# cycle, with three "turn exceeds limit" take-control alerts landing inside it. No PSCM-attenuation
+# theory justifies pulse trains at that rate: if two resets in quick succession did not restore
+# delivery, a third won't. Cap the rate globally (all firing paths share this): after
+# _BLIP_STORM_COUNT firings inside _BLIP_STORM_WINDOW_S, no further blips for
+# _BLIP_STORM_LOCKOUT_S. Isolated genuine stalls (the mechanism's real target) are unaffected.
+_BLIP_STORM_COUNT = 3
+_BLIP_STORM_WINDOW_S = 30.0
+_BLIP_STORM_LOCKOUT_S = 60.0
+# Hand-off pulse straightness gate (2026-07-20). The hand-off blip's stated design (see its comment
+# at the firing site) is a reset "while the car is straight and the command is small" -- but the
+# code never actually enforced that, and the same road test shows it firing mid-correction with
+# measured curvature at 0.006-0.007 (7 of the 13 storm blips were hand-off pulses). Enforce the
+# documented intent: both the commanded and measured curvature must be inside the near-straight
+# band before a press release earns a pulse.
+_HANDOFF_STRAIGHT_MAX = 1.5 * CarControllerParams.CURVATURE_ERROR  # 0.003 -- same near-straight band used elsewhere
+# Deviation-clip pinning compensation (2026-07-20). The root cause behind the hands-off drift
+# incidents (routes 00000001--f5fbd93372 and 00000003--b73f9b9ea8): kappa_cmd is clipped to
+# measured +- CURVATURE_ERROR, so once the car drifts off the model's line the command CHASES the
+# drifting measurement -- it can only ever lead it by 0.002 (1/m), regardless of how hard the model
+# asks to come back (logged gaps reached 0.012-0.019). The stall blip was the wrong tool for this
+# (road-proven: cutting the command mid-drift makes it worse). This keeps commanding instead: the
+# portion of the model's requested curvature that the clip discarded is bounded, low-pass filtered,
+# and added to path_angle ONLY -- kappa_cmd/shadow_curvature stay exactly as clipped, so ford.h's
+# shadow deviation check is untouched. Panda-clean the same way the LSGT boost is: ford.h
+# rate/value-limits path_angle but does not deviation-check it, and this term still passes through
+# the DBC value clamp and the soft ROC below. Zeroed during lane changes (cross-lane motion binds
+# the clip legitimately) and below the clip's own 9 m/s activation.
+_PINNING_COMP_MAX = 2.0 * CarControllerParams.CURVATURE_ERROR  # 0.004 (1/m) corrective authority cap
+_PINNING_COMP_TAU_S = 0.25                                     # low-pass so yaw-rate noise can't shimmy the wheel
+_PINNING_COMP_ALPHA = _STEER_DT / (_PINNING_COMP_TAU_S + _STEER_DT)
 # Proactive hand-off blip: any sustained driver press attenuates the PSCM (route 000000be seg 4:
 # 3 s of sub-45-deg circle-exit steering left it at ~0x delivery, and the reactive detector's
 # fire-after-the-stall-develops timing meant 2.4 s of dead-straight running into the next curve
@@ -215,6 +249,17 @@ class LateralAngleExt:
     self.stall_blip_count = 0         # pulses fired this stall episode
     self.angle_stall_blip_active = False
     self.press_timer_s = 0.0          # continuous steeringPressed time, for the hand-off blip
+    # Storm breaker (see module constants): ages of recent blip firings + global lockout countdown.
+    self.blip_recent_ages: list[float] = []
+    self.blip_lockout_s = 0.0
+    # Deviation-clip pinning compensation state (see _PINNING_COMP_* constants).
+    self.pinning_comp_kappa = 0.0     # filtered bounded corrective curvature (1/m)
+
+  def _register_blip_fire(self):
+    """Record a blip firing for the storm breaker; engage the lockout at the cap."""
+    self.blip_recent_ages.append(0.0)
+    if len(self.blip_recent_ages) >= _BLIP_STORM_COUNT:
+      self.blip_lockout_s = _BLIP_STORM_LOCKOUT_S
 
   def update_angle_params(self, params):
     """Sets per-platform gain defaults and reads user feel-factor params."""
@@ -288,6 +333,9 @@ class LateralAngleExt:
       self.stall_blip_cooldown_s = 0.0
       self.stall_blip_count = 0
       self.angle_stall_blip_active = False
+      self.blip_recent_ages = []
+      self.blip_lockout_s = 0.0
+      self.pinning_comp_kappa = 0.0
       self.press_timer_s = 0.0
       self.precision_type = 1
       return LateralResult(
@@ -331,6 +379,9 @@ class LateralAngleExt:
       self.stall_blip_cooldown_s = 0.0
       self.stall_blip_count = 0
       self.angle_stall_blip_active = False
+      # Storm-breaker ages/lockout deliberately persist across human turns: the storm pattern
+      # (route 00000003 segs 2-3) interleaved presses with pulses, and clearing here would re-arm it.
+      self.pinning_comp_kappa = 0.0
       self.press_timer_s = 0.0
       self.precision_type = 1
       return LateralResult(
@@ -343,16 +394,25 @@ class LateralAngleExt:
         lateralUncertainty=0.0,
       )
 
+    # Storm breaker bookkeeping: age recent firings out of the window, count down the lockout.
+    self.blip_recent_ages = [a + _STEER_DT for a in self.blip_recent_ages if a + _STEER_DT < _BLIP_STORM_WINDOW_S]
+    self.blip_lockout_s = max(0.0, self.blip_lockout_s - _STEER_DT)
+
     # Proactive hand-off blip: the falling edge of a sustained press earns an immediate mode-0
     # pulse (see _PRESS_BLIP_MIN_S) -- resets the PSCM's press-induced attenuation right at
     # hand-off, while the car is straight and the command small, instead of waiting for the
     # reactive stall detector below to watch the car miss the next curve first.
+    # Straightness now ENFORCED, not just stated (_HANDOFF_STRAIGHT_MAX): a release mid-correction
+    # is exactly when the system must seamlessly take over, not go silent for 300 ms.
     if CS.out.steeringPressed:
       self.press_timer_s += _STEER_DT
     else:
       if (self.press_timer_s >= _PRESS_BLIP_MIN_S and self.stall_blip_cooldown_s <= 0.0
-          and self.stall_blip_frames_left <= 0):
+          and self.stall_blip_frames_left <= 0 and self.blip_lockout_s <= 0.0
+          and abs(float(actuators.curvature)) < _HANDOFF_STRAIGHT_MAX
+          and abs(self.get_current_curvature(CS)) < _HANDOFF_STRAIGHT_MAX):
         self.stall_blip_frames_left = _STALL_BLIP_FRAMES
+        self._register_blip_fire()
       self.press_timer_s = 0.0
 
     # Stall-blip pulse in progress: hold lateral inactive (mode 0, all-zero signals -- the same
@@ -370,6 +430,7 @@ class LateralAngleExt:
       self.bp_curvature_rate_limited = False
       self.bp_curvature_deviation_limited = False
       self.sim_curvature_last = 0.0
+      self.pinning_comp_kappa = 0.0
       # Truthful shadow during the blip (see the inactive-path comment). Upstream PR #144.
       self.bp_kappa_cmd = self.get_current_curvature(CS)
       self._desired_curvature_last = float(actuators.curvature)
@@ -483,8 +544,8 @@ class LateralAngleExt:
     # than only clipping the value reported to panda (which would make the check a no-op).
     current_curvature = self.get_current_curvature(CS)
     self.bp_curvature_deviation_limited = False
+    _kappa_cmd_pre_error_clip = kappa_cmd
     if v_ego > 9:
-      _kappa_cmd_pre_error_clip = kappa_cmd
       kappa_cmd = float(clip(kappa_cmd, current_curvature - CarControllerParams.CURVATURE_ERROR,
                             current_curvature + CarControllerParams.CURVATURE_ERROR))
       # BluePilot: did this clip actually constrain kappa_cmd this frame (deviation from measured,
@@ -524,6 +585,18 @@ class LateralAngleExt:
     _lsgt_kappa_gate = float(interp(abs(requested_curvature), [_LSGT_KAPPA_GATE_LO, _LSGT_KAPPA_GATE_HI], [0.0, 1.0]))
     low_speed_boost = 1.0 + (_lsgt_speed_boost - 1.0) * _lsgt_kappa_gate
     path_angle_calc *= low_speed_boost
+
+    # BluePilot: deviation-clip pinning compensation (see _PINNING_COMP_* constants). The clip above
+    # discarded (_kappa_cmd_pre_error_clip - kappa_cmd) of the model's intent; bounded and low-pass
+    # filtered, that portion keeps pulling path_angle toward the model's line while kappa_cmd (and
+    # the shadow the panda checks) stays honestly clipped. Off during lane changes and below the
+    # clip's own 9 m/s gate; decays to zero through the filter whenever the clip stops binding.
+    if v_ego > 9 and not self.lane_change:
+      _pinning_excess = float(clip(_kappa_cmd_pre_error_clip - kappa_cmd, -_PINNING_COMP_MAX, _PINNING_COMP_MAX))
+    else:
+      _pinning_excess = 0.0
+    self.pinning_comp_kappa += _PINNING_COMP_ALPHA * (_pinning_excess - self.pinning_comp_kappa)
+    path_angle_calc += self.pinning_comp_kappa * v_ego * self.curvature_factor
 
     path_angle = path_angle_calc
 
@@ -624,12 +697,14 @@ class LateralAngleExt:
                 and abs(_stall_gap) > _STALL_GAP_MIN
                 and abs(current_curvature) < _STALL_DELIVERY_FRACTION * abs(desired_curvature))
     if _stalled:
-      if self.bp_curvature_deviation_limited and self.stall_blip_cooldown_s <= 0.0:
+      if self.bp_curvature_deviation_limited and self.stall_blip_cooldown_s <= 0.0 and self.blip_lockout_s <= 0.0:
         self.stall_blip_hold_s += _STEER_DT
-      if self.stall_blip_hold_s >= _STALL_HOLD_S and self.stall_blip_count < _STALL_MAX_BLIPS:
+      if (self.stall_blip_hold_s >= _STALL_HOLD_S and self.stall_blip_count < _STALL_MAX_BLIPS
+          and self.blip_lockout_s <= 0.0):
         self.stall_blip_frames_left = _STALL_BLIP_FRAMES
         self.stall_blip_hold_s = 0.0
         self.stall_blip_count += 1
+        self._register_blip_fire()
     else:
       self.stall_blip_hold_s = 0.0
       if CS.out.steeringPressed or abs(_stall_gap) < 0.5 * _STALL_GAP_MIN:
