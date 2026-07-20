@@ -7,14 +7,15 @@ See the LICENSE.md file in the root directory for more details.
 
 # Unit tests for the angle-mode reactive stall detector and shadow-curvature publishing.
 #
-# Stall detector (merged from upstream PRs #148 and the BluePilot drift branch):
-#   - classic branch: the pulse (a 300 ms mode-0 release) must arm only on a FRACTIONAL
-#     delivery failure -- the car achieving under _STALL_DELIVERY_FRACTION of the demanded
-#     curvature -- never on an honest deep-curve entry transient (0.7-0.85x of a large,
-#     fast-rising demand) whose absolute gap clears _STALL_GAP_MIN on magnitude alone.
-#   - drift branch: measured curvature leading a near-straight command (hands-off drift,
-#     "model says straight, car turns") must arm; measured leading a genuine curve command
-#     (normal curve exit) must not.
+# Stall detector (upstream PR #148 fractional gate):
+#   - the pulse (a 300 ms mode-0 release) must arm only on a FRACTIONAL delivery failure --
+#     the car achieving under _STALL_DELIVERY_FRACTION of the demanded curvature -- never on
+#     an honest deep-curve entry transient (0.7-0.85x of a large, fast-rising demand) whose
+#     absolute gap clears _STALL_GAP_MIN on magnitude alone.
+#   - the mirror "drift" case (measured leading a near-straight command: car curving while the
+#     model wants straight) must NOT arm. A drift branch was road-tested 2026-07-20 and
+#     reverted: the mode-0 pulse removed the remaining counter-command mid-drift and the drift
+#     worsened until driver takeover. TestStallDriftCaseStaysUntriggered pins the revert.
 #
 # Shadow curvature (upstream PR #144): bp_kappa_cmd is consumed by carcontroller as the
 # input to ford.h's angle-mode deviation check (Lane_Assist_Data1 bytes 5-6, judged
@@ -140,7 +141,13 @@ class TestStallFractionalGate(unittest.TestCase):
     self.assertEqual(ext.stall_blip_count, 1)
 
 
-class TestStallDriftBranch(unittest.TestCase):
+class TestStallDriftCaseStaysUntriggered(unittest.TestCase):
+  """Pins the 2026-07-20 revert: the blip must NOT fire on hands-off drift or curve exits.
+
+  Road test showed a mode-0 pulse during an active drift removes the remaining
+  counter-command and the drift worsens until driver takeover -- the drift root cause
+  needs a fix that keeps commanding, not one that stops commanding.
+  """
 
   def _drive(self, desired, measured, frames=20, v_ego=15.0):
     ext, CP = _harness()
@@ -149,15 +156,14 @@ class TestStallDriftBranch(unittest.TestCase):
       ext.update_angle_strategy(_CC(latActive=True), cs, _Actuators(curvature=desired), CP)
     return ext
 
-  def test_hands_off_drift_fires(self):
-    # model wants ~straight (inside the deviation clip's noise band) while measured
-    # curvature grows on its own -- the "car turns when it shouldn't" incident class.
+  def test_hands_off_drift_never_fires(self):
+    # model wants ~straight while measured curvature grows on its own: detection here must
+    # never cut the command (see class docstring).
     ext = self._drive(desired=0.001, measured=0.006)
-    self.assertEqual(ext.stall_blip_count, 1)
+    self.assertEqual(ext.stall_blip_count, 0)
 
   def test_curve_exit_never_fires(self):
-    # measured leads desired, but desired is a genuine curve command (>= the near-straight
-    # guard): a normal curve exit transient. A mode-0 pulse mid-exit is itself a hazard.
+    # measured leads desired with a genuine curve command: a normal curve exit transient.
     ext = self._drive(desired=0.005, measured=0.010)
     self.assertEqual(ext.stall_blip_count, 0)
     self.assertEqual(ext.stall_blip_hold_s, 0.0)
