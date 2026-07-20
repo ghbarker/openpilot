@@ -464,7 +464,12 @@ CONFIGS = [
   ),
   ProcessConfig(
     proc_name="card",
-    pubs=["pandaStates", "carControl", "onroadEvents", "can"],
+    # BluePilot: modelV2/liveParameters/selfdriveState/radarState/liveDelay feed the BP Ford
+    # lateral extensions' own SubMaster inside CarController (lateral_curv_ext/lateral_angle_ext).
+    # Without them the replayed card runs the lateral strategies blind (model=None), which does
+    # not reproduce on-road behavior for angle mode.
+    pubs=["pandaStates", "carControl", "onroadEvents", "can",
+          "modelV2", "liveParameters", "selfdriveState", "radarState", "liveDelay"],
     subs=["sendcan", "carState", "carParams", "carOutput", "liveTracks"],
     ignore=["logMonoTime", "carState.cumLagMs"],
     init_callback=card_fingerprint_callback,
