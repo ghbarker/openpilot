@@ -13,7 +13,10 @@ if [[ "$CI" ]]; then
   export BLOCK="${BLOCK},ui"
 fi
 
-python3 -c "from openpilot.selfdrive.test.helpers import set_params_enabled; set_params_enabled()"
+# BluePilot: MadsUnifiedEngagementMode — with fresh sim params, MADS' default blocks
+# unified engagement and silently ERASES pcmEnable/buttonEnable events, so the stack
+# can never engage regardless of cruise edges or button presses.
+python3 -c "from openpilot.selfdrive.test.helpers import set_params_enabled; from openpilot.common.params import Params; set_params_enabled(); Params().put_bool('MadsUnifiedEngagementMode', True)"
 
 SCRIPT_DIR=$(dirname "$0")
 OPENPILOT_DIR=$SCRIPT_DIR/../../
