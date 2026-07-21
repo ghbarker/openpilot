@@ -75,6 +75,8 @@ class FordSimulatedCar:
     self.cruise_enabled = False
     self.btn_set = 0
     self.btn_res_cncl = 0
+    self._cruise_unengaged_frames = 0
+    self._cruise_drop_frames = 0
 
   # ------------------------------------------------------------------
   # Wire command -> PSCM plant
@@ -86,12 +88,27 @@ class FordSimulatedCar:
     # steady; this fake adds patient retry: if openpilot hasn't engaged ~1.5s after
     # cruise latched, drop cruise briefly and let the bridge's SET press produce a fresh
     # rising edge on a clean event board. Stops as soon as engagement sticks.
-    if ss.cruise_button in (3, 4):    # SET / RESUME
+    # Ford CcStat_D_Actl: 3 = standby/available, 4 and 5 = ENABLED. Engagement is a
+    # cruise-state rising edge (pcmCruise), so "off" must be 3 — an earlier version used
+    # 4 as standby, which reads as enabled-from-boot and makes an edge impossible.
+    if self._cruise_drop_frames > 0:
+      self._cruise_drop_frames -= 1
+      self.cruise_enabled = False
+    elif ss.cruise_button in (3, 4):    # SET / RESUME
       self.cruise_enabled = True
     elif ss.cruise_button == 2 or ss.user_brake > 0:  # CANCEL or brake
       self.cruise_enabled = False
-    # openpilot-longitudinal Fords engage on BUTTON EVENTS parsed off Steering_Data_FD1,
-    # not on cruise-state edges — pass the bridge's presses through as CAN signals.
+    # Patient retry: the first rising edge lands in the boot veto storm; if openpilot
+    # hasn't engaged 1.5s after cruise latched, drop to standby briefly so the bridge's
+    # next SET produces a fresh edge on the clean event board. Stops once engaged.
+    if ss.is_engaged:
+      self._cruise_unengaged_frames = 0
+    elif self.cruise_enabled:
+      self._cruise_unengaged_frames += 1
+      if self._cruise_unengaged_frames > 150:
+        self._cruise_unengaged_frames = 0
+        self._cruise_drop_frames = 30
+    # Button passthrough (harmless for pcm engagement; feeds MADS/button paths)
     self.btn_set = 1 if ss.cruise_button == 3 else 0
     self.btn_res_cncl = 1 if ss.cruise_button in (2, 4) else 0
 
@@ -144,7 +161,7 @@ class FordSimulatedCar:
     msg.append(self.packer.make_can_msg("BrakeSnData_4", 0, {}))
     msg.append(self.packer.make_can_msg("EngBrakeData", 0, {
       "BpedDrvAppl_D_Actl": 2 if ss.user_brake > 0 else 1,
-      "CcStat_D_Actl": 5 if self.cruise_enabled else 4,   # 4 = standby, 5 = active (car-owned)
+      "CcStat_D_Actl": 5 if self.cruise_enabled else 3,   # 3 = standby/available, 5 = active
       "Veh_V_DsplyCcSet": 65,                             # cruise setpoint display (kph)
     }))
     msg.append(self.packer.make_can_msg("Cluster_Info1_FD1", 0, {"DrvSlipCtlMde_D_Rq": 0}))
