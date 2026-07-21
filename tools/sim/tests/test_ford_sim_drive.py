@@ -24,8 +24,9 @@ import pytest
 
 from multiprocessing import Queue
 
-from cereal import messaging
+from cereal import car, messaging
 from openpilot.common.basedir import BASEDIR
+from openpilot.common.params import Params
 
 SIM_DIR = os.path.join(BASEDIR, "tools/sim")
 CAR_PROCS = {"card", "controlsd", "selfdrived", "plannerd", "modeld", "locationd", "paramsd"}
@@ -54,7 +55,8 @@ def _attempt():
     p_manager = subprocess.Popen("./launch_openpilot.sh", cwd=SIM_DIR)
     procs.append(p_manager)
 
-    sm = messaging.SubMaster(['selfdriveState', 'onroadEvents', 'managerState', 'carParams', 'controlsState'])
+    sm = messaging.SubMaster(['selfdriveState', 'onroadEvents', 'managerState', 'controlsState'])
+    params = Params()
     q = Queue()
     bridge = MetaDriveBridge(False, False, 60, True)
     p_bridge = bridge.run(q, retries=10)
@@ -76,7 +78,10 @@ def _attempt():
       car_events = [e.name for e in sm['onroadEvents'] if e.noEntry or e.softDisable or e.immediateDisable]
       car_procs_down = [p.name for p in sm['managerState'].processes
                         if p.name in CAR_PROCS and p.shouldBeRunning and not p.running]
-      fp = sm['carParams'].carFingerprint if sm.seen['carParams'] else ""
+      # card publishes the carParams TOPIC once at boot (racy for late subscribers);
+      # the params store is the deterministic source.
+      cp_bytes = params.get("CarParams")
+      fp = messaging.log_from_bytes(cp_bytes, car.CarParams).carFingerprint if cp_bytes else ""
       detail = f"events={car_events} car_procs_down={car_procs_down} fp='{fp}'"
       if not car_events and not car_procs_down and fp == "FORD_MUSTANG_MACH_E_MK1":
         break
