@@ -151,6 +151,19 @@ class ModelState(ModelStateBase):
 def main(demo=False):
   cloudlog.warning("modeld init")
 
+  # BluePilot: on PC (WSL/ROCm) OpenCL context creation is flaky when another process's
+  # CL context (VisionIPC camera buffers) initializes first — pin modeld's GPU context
+  # NOW, before the vipc stream wait below lets camerad win the race. No-op ordering
+  # change elsewhere: the same context is created either way.
+  from openpilot.system.hardware import PC
+  if PC:
+    try:
+      from tinygrad import Device as _TgDevice
+      _TgDevice[_TgDevice.DEFAULT]
+      cloudlog.warning(f"modeld: GPU context pre-pinned ({_TgDevice.DEFAULT})")
+    except Exception as e:
+      cloudlog.error(f"modeld: GPU context pre-pin failed: {e}")
+
   _present = usbgpu_present()
   _compiled = os.path.isfile(get_manifest_path(modeld_pkl_path(usbgpu=True)))
   USBGPU = _present and _compiled
