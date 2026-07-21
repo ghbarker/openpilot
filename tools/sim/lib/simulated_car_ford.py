@@ -69,10 +69,20 @@ class FordSimulatedCar:
     self.path_angle_cmd = 0.0
     self.kappa_plant = 0.0        # current achieved curvature (lagged)
     self.wheel_angle_deg = 0.0    # current wheel angle (drives MetaDrive + pinion sensor)
+    # Cruise state machine: Ford is pcmCruise — the CAR owns cruise engagement, so the
+    # fake must latch it from the bridge's button presses (Honda CruiseButtons values:
+    # 1=MAIN, 2=CANCEL, 3=DECEL_SET, 4=RES_ACCEL) or openpilot waits forever.
+    self.cruise_enabled = False
 
   # ------------------------------------------------------------------
   # Wire command -> PSCM plant
   # ------------------------------------------------------------------
+
+  def _update_cruise(self, ss: SimulatorState):
+    if ss.cruise_button in (3, 4):    # SET / RESUME
+      self.cruise_enabled = True
+    elif ss.cruise_button == 2 or ss.user_brake > 0:  # CANCEL or brake
+      self.cruise_enabled = False
 
   def _update_plant(self, simulator_state: SimulatorState):
     raws = messaging.drain_sock_raw(self.can_sock)
@@ -123,7 +133,7 @@ class FordSimulatedCar:
     msg.append(self.packer.make_can_msg("BrakeSnData_4", 0, {}))
     msg.append(self.packer.make_can_msg("EngBrakeData", 0, {
       "BpedDrvAppl_D_Actl": 2 if ss.user_brake > 0 else 1,
-      "CcStat_D_Actl": 5 if engaged else 4,               # 4 = standby, 5 = active
+      "CcStat_D_Actl": 5 if self.cruise_enabled else 4,   # 4 = standby, 5 = active (car-owned)
       "Veh_V_DsplyCcSet": 65,                             # cruise setpoint display (kph)
     }))
     msg.append(self.packer.make_can_msg("Cluster_Info1_FD1", 0, {"DrvSlipCtlMde_D_Rq": 0}))
@@ -184,6 +194,7 @@ class FordSimulatedCar:
 
   def update(self, simulator_state: SimulatorState):
     try:
+      self._update_cruise(simulator_state)
       self._update_plant(simulator_state)
       self.send_can_messages(simulator_state)
       if self.idx % 50 == 0:
