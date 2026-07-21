@@ -21,13 +21,15 @@ resumed. Mode 0 is panda-clean by construction: every ford.h check has a legitim
 back in from zero through the soft ROC below (no jump seed) -- generous at human-turn speeds, and
 admitted by ford.h's path_angle ROC check (2% looser) without any bypass.
 """
+import re
+
 import numpy as np
 from numpy import clip, interp
 
 from opendbc.car import DT_CTRL
 from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.ford.values import CAR, CarControllerParams
-from opendbc.sunnypilot.car.ford.angle_autocal import AutoCalPipeline
+from opendbc.sunnypilot.car.ford.angle_autocal import AutoCalPipeline, VERIFY_TOL, MAX_ROUNDS
 from opendbc.sunnypilot.car.ford.lateral_curv_ext import LateralResult
 from opendbc.sunnypilot.car.ford.human_turn import HumanTurnDetector
 from opendbc.sunnypilot.car.ford.values_ext import BP_ANGLE_LIMITS
@@ -216,6 +218,10 @@ class LateralAngleExt:
             state = state.decode("utf-8", errors="replace")
           self.autocal_done = state.startswith("done")
           self.autocal_enabled = enabled and not self.autocal_done
+          # Verification round number: 1 on a fresh start, parsed back from the state string
+          # after an "applied" round so rounds survive restarts and drives.
+          _m = re.search(r"round (\d+)", state)
+          self._autocal_round = int(_m.group(1)) if _m else 1
           # (Re)build the pipeline when arming, and restart it if the user hand-changes a
           # factor mid-collection — samples are relative to the factors in force when taken.
           factors_changed = (self.autocal is not None and
@@ -621,23 +627,39 @@ class LateralAngleExt:
     )
 
   def _autocal_finish(self):
-    """Write the converged factors and lock the calibration (one-time, per-car)."""
+    """A round converged. Apply the factors; lock only when a verification round confirms.
+
+    Round semantics: the ratio model is first-order, so a large correction is applied and
+    then re-measured with the new factors in force. When a round's recommendation is a
+    no-change within VERIFY_TOL (or MAX_ROUNDS is hit), the calibration locks for good.
+    """
     result = self.autocal.est.solve()
     if result is None or self._autocal_params_handle is None:
       return
     low_new, high_new, stats = result
+    delta_low = abs(low_new - self.autocal.est.low_factor_applied)
+    delta_high = abs(high_new - self.autocal.est.high_factor_applied)
+    verified = delta_low <= VERIFY_TOL and delta_high <= VERIFY_TOL
+    final = verified or self._autocal_round >= MAX_ROUNDS
+    if final:
+      state = (f"done low={low_new:.2f} high={high_new:.2f} rounds={self._autocal_round} "
+               f"{'verified' if verified else 'round-limit'} n={stats['n']} "
+               f"se={stats['stderr_low']:.3f}/{stats['stderr_high']:.3f}")
+    else:
+      state = (f"round {self._autocal_round + 1} collecting; applied low={low_new:.2f} "
+               f"high={high_new:.2f} (moved {delta_low:.2f}/{delta_high:.2f})")
     try:
       self._autocal_params_handle.put("FordLowSpeedFactor_ang", f"{low_new:.2f}")
       self._autocal_params_handle.put("FordHighSpeedFactor_ang", f"{high_new:.2f}")
-      self._autocal_params_handle.put(
-        "FordAngleAutoCalState",
-        f"done low={low_new:.2f} high={high_new:.2f} n={stats['n']} "
-        f"se={stats['stderr_low']:.3f}/{stats['stderr_high']:.3f}")
+      self._autocal_params_handle.put("FordAngleAutoCalState", state)
     except Exception:
       return
     # Apply immediately so this drive benefits without waiting for the param round-trip.
     self.low_speed_curv_factor = float(low_new)
     self.high_speed_curv_factor = float(high_new)
-    self.autocal_done = True
-    self.autocal_enabled = False
-    self.autocal = None
+    self.autocal = None  # verification rounds rebuild against the new factors on the next param tick
+    if final:
+      self.autocal_done = True
+      self.autocal_enabled = False
+    else:
+      self._autocal_round += 1

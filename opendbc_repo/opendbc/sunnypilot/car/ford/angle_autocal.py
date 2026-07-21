@@ -76,9 +76,20 @@ PRESS_COOLDOWN_S = 3.0      # after any grip ends, delivery is suspect this long
 
 # Convergence: effective weight is accumulated seconds of valid steady cornering.
 CONVERGE_MIN_WEIGHT = 30.0   # per anchor (~30 s of steady curves near each anchor)
-CONVERGE_MAX_STDERR = 0.02   # fit standard error per anchor (2% of gain)
+# Real-road residual scatter (crown, wind, surface) floors around 2-2.5% even with hours of
+# clean samples (measured: 2.7 h Mach-E drive -> stderr 0.022/0.026), so 2% was unreachably
+# strict. 3% matches VERIFY_TOL: a fit good to ~3% is exactly what a verification round can
+# confirm or refute, and rounds are the real lock guard.
+CONVERGE_MAX_STDERR = 0.03   # fit standard error per anchor
 
 FACTOR_MIN, FACTOR_MAX = 0.5, 1.5  # same clamp as the settings +/- buttons
+
+# Multi-round verification: after a converged fit the factors are applied and collection
+# restarts against them; the calibration only locks when a subsequent round's recommendation
+# is a no-change within VERIFY_TOL (proof the correction actually landed on the real car —
+# the ratio model is first-order, so a large correction deserves a confirmation pass).
+VERIFY_TOL = 0.03    # per-factor |new - applied| considered "no further change"
+MAX_ROUNDS = 4       # safety bound; lock after this many applications regardless
 
 
 def speed_alpha(v_ego: float) -> float:

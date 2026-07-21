@@ -25,8 +25,8 @@ import numpy as np
 
 from opendbc.car.vehicle_model import VehicleModel
 from opendbc.sunnypilot.car.ford.angle_autocal import (
-  AutoCalPipeline, platform_gains, V_LOW, V_HIGH,
-  CONVERGE_MIN_WEIGHT, CONVERGE_MAX_STDERR,
+  AutoCalPipeline, platform_gains, speed_alpha, V_LOW, V_HIGH, LOW_ANCHOR_BASE,
+  CONVERGE_MIN_WEIGHT, CONVERGE_MAX_STDERR, VERIFY_TOL,
 )
 
 
@@ -187,38 +187,97 @@ def main():
         f"(evidence {stats['weight_low']:.0f}s / need {CONVERGE_MIN_WEIGHT:.0f}s, stderr {stats['stderr_low']:.3f} / max {CONVERGE_MAX_STDERR})")
   print(f"FordHighSpeedFactor_ang: {ex.high_factor:.2f} -> {high_new:.2f}   "
         f"(evidence {stats['weight_high']:.0f}s / need {CONVERGE_MIN_WEIGHT:.0f}s, stderr {stats['stderr_high']:.3f} / max {CONVERGE_MAX_STDERR})")
-  print(f"converged (would lock onboard): {conv}")
+  print(f"converged: {conv}")
+  delta = max(abs(low_new - ex.low_factor), abs(high_new - ex.high_factor))
+  if conv and delta <= VERIFY_TOL:
+    print("recommendation is a NO-CHANGE within tolerance — calibration is VERIFIED and would lock onboard.")
+  elif conv:
+    print(f"next step: apply these factors (settings +/- or the onboard toggle), drive again, re-run this "
+          f"tool — when the new recommendation moves less than {VERIFY_TOL:.2f}, it's verified and locks.")
 
-  write_report(ex, est, accepted, (low_new, high_new, stats), conv,
+  write_report(ex, est, accepted, (low_new, high_new, stats), conv, g_high,
                os.path.join(os.path.dirname(os.path.abspath(__file__)), "angle_autocal_report.html"))
 
 
-def write_report(ex, est, accepted, result, converged, out_path):
+def write_report(ex, est, accepted, result, converged, g_high, out_path):
   low_new, high_new, stats = result
-  pts = []
-  for row in accepted:
-    r = row["kappa_meas"] / row["kappa_cmd"]
-    pts.append((row["v"], r))
 
-  # SVG scatter: ratio vs speed, with anchor lines
+  def gain_new(v):
+    a = speed_alpha(v)
+    return (1.0 - a) * (LOW_ANCHOR_BASE * low_new) + a * (g_high * high_new)
+
+  def gain_shift(v):
+    """Multiplier the new factors apply to the achieved curvature at speed v."""
+    return gain_new(v) / est.applied_gain(v)
+
+  # --- Scatter: ratio vs speed, before (orange) and predicted after (green) ---
   w, h = 900, 420
   x0, x1 = 5.0, 35.0
   y0, y1 = 0.5, 1.5
   def sx(v):
     return 60 + (v - x0) / (x1 - x0) * (w - 90)
   def sy(r):
-    return 20 + (y1 - r) / (y1 - y0) * (h - 70)
-  dots = "".join(
-    f'<circle cx="{sx(v):.1f}" cy="{sy(min(max(r, y0), y1)):.1f}" r="3" fill="#e4781c" fill-opacity="0.55"/>'
-    for v, r in pts)
+    return 20 + (y1 - min(max(r, y0), y1)) / (y1 - y0) * (h - 70)
+  before_dots, after_dots = [], []
+  err_before = dict(low=[], high=[])
+  err_after = dict(low=[], high=[])
+  for row in accepted:
+    v = row["v"]
+    r = row["kappa_meas"] / row["kappa_cmd"]
+    r_after = r * gain_shift(v)
+    before_dots.append(f'<circle cx="{sx(v):.1f}" cy="{sy(r):.1f}" r="3" fill="#e4781c" fill-opacity="0.5"/>')
+    after_dots.append(f'<circle cx="{sx(v):.1f}" cy="{sy(r_after):.1f}" r="3" fill="#3fbf6f" fill-opacity="0.5"/>')
+    band = "low" if speed_alpha(v) < 0.5 else "high"
+    err_before[band].append(abs(r - 1.0))
+    err_after[band].append(abs(r_after - 1.0))
+
+  def mean(xs):
+    return sum(xs) / len(xs) if xs else float("nan")
+
   anchors = (f'<line x1="{sx(V_LOW)}" y1="20" x2="{sx(V_LOW)}" y2="{h-50}" stroke="#888" stroke-dasharray="4"/>'
              f'<line x1="{sx(V_HIGH)}" y1="20" x2="{sx(V_HIGH)}" y2="{h-50}" stroke="#888" stroke-dasharray="4"/>'
              f'<line x1="60" y1="{sy(1.0)}" x2="{w-30}" y2="{sy(1.0)}" stroke="#4a4" stroke-width="1.5"/>')
   labels = (f'<text x="{sx(V_LOW)}" y="{h-34}" fill="#aaa" font-size="12" text-anchor="middle">{V_LOW*2.237:.0f} mph anchor</text>'
             f'<text x="{sx(V_HIGH)}" y="{h-34}" fill="#aaa" font-size="12" text-anchor="middle">{V_HIGH*2.237:.0f} mph anchor</text>'
-            f'<text x="50" y="{sy(1.0)+4}" fill="#4a4" font-size="12" text-anchor="end">1.0</text>'
-            f'<text x="50" y="{sy(1.25)+4}" fill="#888" font-size="12" text-anchor="end">1.25</text>'
-            f'<text x="50" y="{sy(0.75)+4}" fill="#888" font-size="12" text-anchor="end">0.75</text>')
+            f'<text x="50" y="{sy(1.0)+4}" fill="#4a4" font-size="12" text-anchor="end">1.0</text>')
+
+  # --- Drive timeline: requested vs actual vs predicted-after, angle-active frames only ---
+  active = [row for row in ex.rows if row["lat_active"]]
+  tw, th = 900, 300
+  strip = ""
+  if active:
+    t0 = active[0]["t"]
+    # Collapse replay gaps (segment boundaries / disengaged stretches) into a compact timeline
+    xs, last_t, xacc = [], None, 0.0
+    for row in active:
+      if last_t is not None:
+        xacc += min(row["t"] - last_t, 0.5)
+      last_t = row["t"]
+      xs.append(xacc)
+    span = max(xs[-1], 1.0)
+    k_lim = 0.008
+    step = max(1, len(active) // 2400)
+    def tx(x):
+      return 50 + x / span * (tw - 70)
+    def ty(k):
+      return 10 + (k_lim - min(max(k, -k_lim), k_lim)) / (2 * k_lim) * (th - 40)
+    def polylines(key, color, scale_fn=None):
+      out, seg_pts, last_x = [], [], None
+      for x, row in zip(xs[::step], active[::step]):
+        if last_x is not None and x - last_x > 3.0:
+          if len(seg_pts) > 1:
+            out.append(f'<polyline points="{" ".join(seg_pts)}" fill="none" stroke="{color}" stroke-width="1.2" stroke-opacity="0.85"/>')
+          seg_pts = []
+        val = row[key] * (scale_fn(row["v"]) if scale_fn else 1.0)
+        seg_pts.append(f"{tx(x):.1f},{ty(val):.1f}")
+        last_x = x
+      if len(seg_pts) > 1:
+        out.append(f'<polyline points="{" ".join(seg_pts)}" fill="none" stroke="{color}" stroke-width="1.2" stroke-opacity="0.85"/>')
+      return "".join(out)
+    strip = (f'<line x1="50" y1="{ty(0)}" x2="{tw-20}" y2="{ty(0)}" stroke="#444"/>'
+             + polylines("kappa_cmd", "#cccccc")
+             + polylines("kappa_meas", "#e4781c")
+             + polylines("kappa_meas", "#3fbf6f", scale_fn=gain_shift))
 
   html = f"""<meta charset="utf-8"><title>Angle auto-cal — {ex.fingerprint}</title>
 <body style="background:#14161a;color:#ddd;font-family:system-ui;max-width:960px;margin:24px auto;padding:0 16px">
@@ -229,11 +288,29 @@ def write_report(ex, est, accepted, result, converged, out_path):
 <tr><td style="padding:4px 16px 4px 0">Low speed (&le;{V_LOW*2.237:.0f} mph)</td><td align="center">{ex.low_factor:.2f}</td><td align="center"><b>{low_new:.2f}</b></td><td align="center">{stats['weight_low']:.0f}s / {CONVERGE_MIN_WEIGHT:.0f}s</td><td align="center">{stats['stderr_low']:.3f}</td></tr>
 <tr><td style="padding:4px 16px 4px 0">High speed (&ge;{V_HIGH*2.237:.0f} mph)</td><td align="center">{ex.high_factor:.2f}</td><td align="center"><b>{high_new:.2f}</b></td><td align="center">{stats['weight_high']:.0f}s / {CONVERGE_MIN_WEIGHT:.0f}s</td><td align="center">{stats['stderr_high']:.3f}</td></tr>
 </table>
-<p><b>{"CONVERGED — the onboard calibrator would lock these values." if converged else "Not yet converged — more steady engaged curves needed (see evidence column)."}</b></p>
-<h3>Actual / requested turn ratio vs speed</h3>
-<p style="color:#999">Each dot is a steady engaged curve moment. Below the green line = car turns less than requested (factor should rise). Above = turns more (factor should drop).</p>
-<svg width="{w}" height="{h}" style="background:#1b1e24;border-radius:8px">{anchors}{dots}{labels}
+<p><b>{"CONVERGED." if converged else "Not yet converged — more steady engaged curves needed (see evidence column)."}</b>
+This tool and the onboard calibrator verify in rounds: apply the recommendation, drive, re-run —
+when a round recommends a change smaller than {VERIFY_TOL:.2f}, the calibration is verified and locks.</p>
+
+<h3>Drive timeline: requested vs actual turn</h3>
+<p style="color:#999"><span style="color:#ccc">requested</span> ·
+<span style="color:#e4781c">actual (this drive)</span> ·
+<span style="color:#3fbf6f">predicted actual with recommended factors</span> — gaps compressed, engaged angle-mode frames only.</p>
+<svg width="{tw}" height="{th}" style="background:#1b1e24;border-radius:8px">{strip}</svg>
+
+<h3>Actual / requested ratio vs speed — before and after</h3>
+<p style="color:#999">Green line = perfect tracking. <span style="color:#e4781c">Orange: this drive.</span>
+<span style="color:#3fbf6f">Green: predicted with the recommended factors.</span></p>
+<svg width="{w}" height="{h}" style="background:#1b1e24;border-radius:8px">{anchors}{"".join(before_dots)}{"".join(after_dots)}{labels}
 <text x="{w/2}" y="{h-8}" fill="#aaa" font-size="13" text-anchor="middle">speed (m/s)</text></svg>
+
+<table style="border-collapse:collapse;margin:14px 0">
+<tr><th style="text-align:left;padding:4px 16px 4px 0">Mean tracking error |ratio − 1|</th><th style="padding:4px 16px">this drive</th><th style="padding:4px 16px">predicted after</th></tr>
+<tr><td style="padding:4px 16px 4px 0">low-speed band</td><td align="center">{mean(err_before['low'])*100:.1f}%</td><td align="center"><b>{mean(err_after['low'])*100:.1f}%</b></td></tr>
+<tr><td style="padding:4px 16px 4px 0">high-speed band</td><td align="center">{mean(err_before['high'])*100:.1f}%</td><td align="center"><b>{mean(err_after['high'])*100:.1f}%</b></td></tr>
+</table>
+<p style="color:#777;font-size:13px">The "after" traces are first-order predictions (achieved turn scales with the gain change);
+the verification round on the real car is what proves them.</p>
 </body>"""
   with open(out_path, "w", encoding="utf-8") as f:
     f.write(html)
