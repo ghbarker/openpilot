@@ -175,6 +175,10 @@ class FordSimulatedCar:
     # Mach-E has BSM: the cam parser requires the side radars (5 Hz on the real car)
     msg.append(self.packer.make_can_msg("Side_Detect_L_Stat", 2, {}))
     msg.append(self.packer.make_can_msg("Side_Detect_R_Stat", 2, {}))
+    # CANFD pseudo-radar: radard parses Steer_Assist_Data off the camera bus; without it
+    # radarState never validates and longitudinalPlan/commIssue block engagement forever.
+    # Empty payload = radar sees no lead, which is a perfectly valid radar state.
+    msg.append(self.packer.make_can_msg("Steer_Assist_Data", 2, {}))
 
     self.pm.send('can', can_list_to_can_capnp(msg))
 
