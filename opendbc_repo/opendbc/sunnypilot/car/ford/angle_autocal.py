@@ -65,6 +65,14 @@ MIN_KAPPA = 0.001           # 1/m; fully inside the high-curvature branch the fa
 MAX_KAPPA_RATE = 0.0015     # 1/m/s; quasi-steady curvature only
 STEADY_TIME_S = 0.6         # command must be steady this long before samples count (PSCM lag)
 MIN_RATIO, MAX_RATIO = 0.4, 2.5  # discard absurd ratios (measurement glitches)
+MAX_LAT_ACCEL = 2.5         # m/s^2; kappa*v^2 above this is tire/comfort-limit territory, not gain error
+
+# Driver-contamination guards. Ford flips steeringPressed at STEER_DRIVER_ALLOWANCE (1.0 Nm)
+# sustained — a light grip below that threshold still steers the car, and the PSCM under-delivers
+# for seconds after any touch (post-override attenuation observed on the Mach-E). So:
+TORQUE_GUARD_NM = 0.5       # treat half the pressed threshold as hands-on for calibration purposes
+PRESS_HOLDBACK_S = 1.0      # samples are staged this long; any grip during staging cancels them
+PRESS_COOLDOWN_S = 3.0      # after any grip ends, delivery is suspect this long — no samples
 
 # Convergence: effective weight is accumulated seconds of valid steady cornering.
 CONVERGE_MIN_WEIGHT = 30.0   # per anchor (~30 s of steady curves near each anchor)
@@ -121,6 +129,8 @@ class AngleFactorEstimator:
     """
     if abs(kappa_cmd) < MIN_KAPPA or v_ego < MIN_SPEED:
       return False
+    if abs(kappa_cmd) * v_ego * v_ego > MAX_LAT_ACCEL:
+      return False  # the car may physically be unable to make this turn — not gain information
     if kappa_cmd * kappa_meas <= 0.0:
       return False
     r = kappa_meas / kappa_cmd
@@ -208,15 +218,81 @@ class SteadyStateGate:
     self.dt = dt
     self.steady_s = 0.0
     self.kappa_last = None
+    self.grip_cooldown_s = 0.0
 
   def update(self, lat_active: bool, kappa_cmd: float, steering_pressed: bool,
              angle_rate_limited: bool, deviation_limited: bool,
-             human_turn: bool, stall_blip: bool) -> bool:
-    ok = (lat_active and not steering_pressed and not angle_rate_limited
-          and not deviation_limited and not human_turn and not stall_blip
+             human_turn: bool, stall_blip: bool,
+             saturated: bool = False, driver_torque: float = 0.0) -> bool:
+    # Any grip — including light torque below the steeringPressed threshold — starts a
+    # cooldown: the driver was steering, and the PSCM's delivery stays suspect for a while
+    # after release (post-touch attenuation).
+    grip = steering_pressed or human_turn or abs(driver_torque) > TORQUE_GUARD_NM
+    if grip:
+      self.grip_cooldown_s = PRESS_COOLDOWN_S
+    else:
+      self.grip_cooldown_s = max(0.0, self.grip_cooldown_s - self.dt)
+
+    ok = (lat_active and not grip and self.grip_cooldown_s <= 0.0
+          and not angle_rate_limited and not deviation_limited
+          and not stall_blip and not saturated
           and abs(kappa_cmd) >= MIN_KAPPA)
     if ok and self.kappa_last is not None:
       ok = abs(kappa_cmd - self.kappa_last) / self.dt <= MAX_KAPPA_RATE
     self.kappa_last = kappa_cmd if lat_active else None
     self.steady_s = self.steady_s + self.dt if ok else 0.0
     return self.steady_s >= STEADY_TIME_S
+
+
+class AutoCalPipeline:
+  """Gate + holdback staging + estimator, driven with one call per 20 Hz lateral frame.
+
+  Samples sit in a staging queue for PRESS_HOLDBACK_S before they reach the estimator;
+  if the driver grips the wheel while they wait, they are cancelled — the grip was
+  likely already influencing the car before detection tripped. Used identically by the
+  onboard hook and the offline analyzer.
+  """
+
+  def __init__(self, platform_gain_high: float, low_factor_applied: float,
+               high_factor_applied: float, dt: float = 0.05):
+    self.est = AngleFactorEstimator(platform_gain_high, low_factor_applied, high_factor_applied)
+    self.gate = SteadyStateGate(dt=dt)
+    self.dt = dt
+    self._staged: list[list] = []  # [age_s, v, kappa_cmd, kappa_meas]
+
+  def idle(self):
+    """Call on frames where lateral is inactive (disengaged / human-turn override)."""
+    self.gate.update(False, 0.0, False, False, False, False, False)
+    self._staged.clear()
+
+  def update(self, v_ego: float, kappa_cmd: float, kappa_meas: float,
+             steering_pressed: bool, angle_rate_limited: bool, deviation_limited: bool,
+             human_turn: bool, stall_blip: bool,
+             saturated: bool = False, driver_torque: float = 0.0) -> list:
+    """Advance one frame. Returns the samples committed to the estimator this frame
+    as (v, kappa_cmd, kappa_meas) tuples — the offline analyzer plots them; the
+    onboard hook ignores the return value."""
+    grip = steering_pressed or human_turn or abs(driver_torque) > TORQUE_GUARD_NM
+    if grip:
+      self._staged.clear()
+
+    eligible = self.gate.update(True, kappa_cmd, steering_pressed,
+                                angle_rate_limited, deviation_limited,
+                                human_turn, stall_blip,
+                                saturated=saturated, driver_torque=driver_torque)
+
+    # Age the staging queue; entries that survived the holdback graduate to the estimator.
+    committed = []
+    still_staged = []
+    for entry in self._staged:
+      entry[0] += self.dt
+      if entry[0] >= PRESS_HOLDBACK_S:
+        if self.est.add_sample(entry[1], entry[2], entry[3], weight=self.dt):
+          committed.append((entry[1], entry[2], entry[3]))
+      else:
+        still_staged.append(entry)
+    self._staged = still_staged
+
+    if eligible:
+      self._staged.append([0.0, v_ego, kappa_cmd, kappa_meas])
+    return committed

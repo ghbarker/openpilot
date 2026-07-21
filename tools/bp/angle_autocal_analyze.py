@@ -25,7 +25,7 @@ import numpy as np
 
 from opendbc.car.vehicle_model import VehicleModel
 from opendbc.sunnypilot.car.ford.angle_autocal import (
-  AngleFactorEstimator, SteadyStateGate, platform_gains, V_LOW, V_HIGH,
+  AutoCalPipeline, platform_gains, V_LOW, V_HIGH,
   CONVERGE_MIN_WEIGHT, CONVERGE_MAX_STDERR,
 )
 
@@ -68,6 +68,7 @@ class DriveExtractor:
     self.v_ego = 0.0
     self.steering_deg = 0.0
     self.steering_pressed = False
+    self.steering_torque = 0.0
     self.lat_active = False
     self.kappa_desired = 0.0
     self.flags = dict(angle_rate=False, deviation=False, human_turn=False, stall=False)
@@ -104,6 +105,7 @@ class DriveExtractor:
         self.v_ego = cs.vEgoRaw
         self.steering_deg = cs.steeringAngleDeg
         self.steering_pressed = cs.steeringPressed
+        self.steering_torque = cs.steeringTorque
       elif w == "carControl":
         cc = e.carControl
         self.lat_active = cc.latActive
@@ -115,6 +117,7 @@ class DriveExtractor:
           deviation=st.curvatureDeviationLimited,
           human_turn=st.humanTurnLateralPaused,
           stall=st.stallBlipActive,
+          saturated=st.angleSaturated,  # absent in pre-field logs -> capnp default False
         )
         self.mode_angle = int(st.bmsPrimaryControlVariable) == 1
         self.bp_lat_disabled = st.bmsDisableBpLateralControl
@@ -129,6 +132,7 @@ class DriveExtractor:
           kappa_meas=self.kappa_measured(),
           lat_active=self.lat_active and self.mode_angle and not self.bp_lat_disabled,
           pressed=self.steering_pressed,
+          torque=self.steering_torque,
           **self.flags,
         ))
 
@@ -151,17 +155,20 @@ def main():
   print(f"factors active during drive: low={ex.low_factor:.2f} high={ex.high_factor:.2f}")
 
   g_low, g_high = platform_gains(ex.fingerprint)
-  est = AngleFactorEstimator(g_high, ex.low_factor, ex.high_factor)
-  gate = SteadyStateGate()
+  pipe = AutoCalPipeline(g_high, ex.low_factor, ex.high_factor)
+  est = pipe.est
   accepted = []
   angle_frames = 0
   for row in ex.rows:
-    if row["lat_active"]:
-      angle_frames += 1
-    if gate.update(row["lat_active"], row["kappa_cmd"], row["pressed"],
-                   row["angle_rate"], row["deviation"], row["human_turn"], row["stall"]):
-      if est.add_sample(row["v"], row["kappa_cmd"], row["kappa_meas"], weight=gate.dt):
-        accepted.append(row)
+    if not row["lat_active"]:
+      pipe.idle()
+      continue
+    angle_frames += 1
+    for v, kc, km in pipe.update(row["v"], row["kappa_cmd"], row["kappa_meas"],
+                                 row["pressed"], row["angle_rate"], row["deviation"],
+                                 row["human_turn"], row["stall"],
+                                 saturated=row["saturated"], driver_torque=row["torque"]):
+      accepted.append(dict(v=v, kappa_cmd=kc, kappa_meas=km))
 
   print(f"angle-mode active frames: {angle_frames} ({angle_frames/20:.0f}s)   accepted samples: {len(accepted)} ({len(accepted)/20:.0f}s)")
   if angle_frames == 0:

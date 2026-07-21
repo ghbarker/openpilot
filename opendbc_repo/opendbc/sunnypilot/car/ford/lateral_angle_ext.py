@@ -27,7 +27,7 @@ from numpy import clip, interp
 from opendbc.car import DT_CTRL
 from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.ford.values import CAR, CarControllerParams
-from opendbc.sunnypilot.car.ford.angle_autocal import AngleFactorEstimator, SteadyStateGate
+from opendbc.sunnypilot.car.ford.angle_autocal import AutoCalPipeline
 from opendbc.sunnypilot.car.ford.lateral_curv_ext import LateralResult
 from opendbc.sunnypilot.car.ford.human_turn import HumanTurnDetector
 from opendbc.sunnypilot.car.ford.values_ext import BP_ANGLE_LIMITS
@@ -169,10 +169,12 @@ class LateralAngleExt:
     # calibrator never runs again (toggling the setting off clears the state to allow a re-run).
     self.autocal_enabled = False
     self.autocal_done = True  # conservative until params are read
-    self.autocal_est = None
-    self.autocal_gate = None
+    self.autocal = None       # AutoCalPipeline while collecting
     self._autocal_param_ctr = 0
     self._autocal_params_handle = None
+    # Telemetry + autocal gate: the command this frame was modified by PSCM authority
+    # limits or the DBC clamp — the car could not make the requested turn.
+    self.bp_angle_saturated = False
 
   def update_angle_params(self, params):
     """Sets per-platform gain defaults and reads user feel-factor params."""
@@ -214,19 +216,17 @@ class LateralAngleExt:
             state = state.decode("utf-8", errors="replace")
           self.autocal_done = state.startswith("done")
           self.autocal_enabled = enabled and not self.autocal_done
-          # (Re)build the estimator when arming, and restart it if the user hand-changes a
+          # (Re)build the pipeline when arming, and restart it if the user hand-changes a
           # factor mid-collection — samples are relative to the factors in force when taken.
-          factors_changed = (self.autocal_est is not None and
-                             (abs(self.autocal_est.low_factor_applied - self.low_speed_curv_factor) > 1e-6 or
-                              abs(self.autocal_est.high_factor_applied - self.high_speed_curv_factor) > 1e-6))
-          if self.autocal_enabled and (self.autocal_est is None or factors_changed):
-            self.autocal_est = AngleFactorEstimator(self.path_angle_gain_highC_highV,
-                                                    self.low_speed_curv_factor,
-                                                    self.high_speed_curv_factor)
-            self.autocal_gate = SteadyStateGate(dt=_STEER_DT)
+          factors_changed = (self.autocal is not None and
+                             (abs(self.autocal.est.low_factor_applied - self.low_speed_curv_factor) > 1e-6 or
+                              abs(self.autocal.est.high_factor_applied - self.high_speed_curv_factor) > 1e-6))
+          if self.autocal_enabled and (self.autocal is None or factors_changed):
+            self.autocal = AutoCalPipeline(self.path_angle_gain_highC_highV,
+                                           self.low_speed_curv_factor,
+                                           self.high_speed_curv_factor, dt=_STEER_DT)
           elif not self.autocal_enabled:
-            self.autocal_est = None
-            self.autocal_gate = None
+            self.autocal = None
           self._autocal_params_handle = params
         except Exception:
           self.autocal_enabled = False
@@ -275,8 +275,9 @@ class LateralAngleExt:
       self.angle_stall_blip_active = False
       self.press_timer_s = 0.0
       self.precision_type = 1
-      if self.autocal_gate is not None:  # steady-state timer must not span disengagements
-        self.autocal_gate.update(False, 0.0, False, False, False, False, False)
+      self.bp_angle_saturated = False
+      if self.autocal is not None:  # steady-state timer and staged samples must not span disengagements
+        self.autocal.idle()
       return LateralResult(
         apply_curvature=0.0,
         curvature_rate=0.0,
@@ -320,8 +321,9 @@ class LateralAngleExt:
       self.angle_stall_blip_active = False
       self.press_timer_s = 0.0
       self.precision_type = 1
-      if self.autocal_gate is not None:  # steady-state timer must not span disengagements
-        self.autocal_gate.update(False, 0.0, False, False, False, False, False)
+      self.bp_angle_saturated = False
+      if self.autocal is not None:  # steady-state timer and staged samples must not span disengagements
+        self.autocal.idle()
       return LateralResult(
         apply_curvature=0.0,
         curvature_rate=0.0,
@@ -514,7 +516,11 @@ class LateralAngleExt:
     elif _pscm_lim >= 1:  # LimitClose (F150/non-angle-mode only): block increases only
       path_angle = float(clip(path_angle, -abs(self.path_angle_last), abs(self.path_angle_last)))
 
+    _pre_dbc_clamp = path_angle
     path_angle = min(FORD_DBC_PATH_ANGLE_MAX, max(FORD_DBC_PATH_ANGLE_MIN, path_angle))
+    # BluePilot: the car cannot make the requested turn this frame — PSCM authority limit
+    # active or the DBC clamp bit. Telemetry + a hard no-sample gate for the auto-calibration.
+    self.bp_angle_saturated = bool(_in_hard_sat or _pscm_lim >= 1 or path_angle != _pre_dbc_clamp)
 
     # Soft ROC limit — unconditional, slightly tighter than ford.h, applied before the
     # hardware bypass in ford.h is re-enabled.  Lets us observe whether the limit would
@@ -591,14 +597,18 @@ class LateralAngleExt:
     # BluePilot: one-time auto-calibration — feed steady engaged curves to the estimator and,
     # on convergence, write the corrected factors once and lock. kappa_cmd here is the exact
     # post-clip curvature path_angle was derived from; current_curvature is the same measured
-    # value the strategy itself steers against.
-    if self.autocal_enabled and self.autocal_est is not None and self.autocal_gate is not None:
-      if self.autocal_gate.update(True, kappa_cmd, CS.out.steeringPressed,
-                                  self.bp_angle_rate_limited, self.bp_curvature_deviation_limited,
-                                  self.angle_human_turn_active, self.angle_stall_blip_active):
-        self.autocal_est.add_sample(v_ego, kappa_cmd, current_curvature, weight=_STEER_DT)
-        if self.autocal_est.n % 20 == 0 and self.autocal_est.converged():
-          self._autocal_finish()
+    # value the strategy itself steers against. The pipeline stages samples for 1s (a grip
+    # cancels them retroactively), holds a 3s post-grip cooldown, and drops any frame where
+    # the car couldn't make the turn (PSCM authority / DBC saturation, tire-limit lat accel).
+    if self.autocal_enabled and self.autocal is not None:
+      self.autocal.update(v_ego, kappa_cmd, current_curvature,
+                          CS.out.steeringPressed,
+                          self.bp_angle_rate_limited, self.bp_curvature_deviation_limited,
+                          self.angle_human_turn_active, self.angle_stall_blip_active,
+                          saturated=self.bp_angle_saturated,
+                          driver_torque=float(CS.out.steeringTorque))
+      if self.autocal.est.n > 0 and self.autocal.est.n % 20 == 0 and self.autocal.est.converged():
+        self._autocal_finish()
 
     return LateralResult(
       apply_curvature=0.0,
@@ -612,7 +622,7 @@ class LateralAngleExt:
 
   def _autocal_finish(self):
     """Write the converged factors and lock the calibration (one-time, per-car)."""
-    result = self.autocal_est.solve()
+    result = self.autocal.est.solve()
     if result is None or self._autocal_params_handle is None:
       return
     low_new, high_new, stats = result
@@ -630,5 +640,4 @@ class LateralAngleExt:
     self.high_speed_curv_factor = float(high_new)
     self.autocal_done = True
     self.autocal_enabled = False
-    self.autocal_est = None
-    self.autocal_gate = None
+    self.autocal = None

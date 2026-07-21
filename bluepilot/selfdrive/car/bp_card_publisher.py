@@ -133,6 +133,7 @@ def publish_controller_state_bp(CI, pm):
     cs_bp.curvatureDeviationLimited = getattr(CI.CC, "curvatureDeviationLimited", False)
     cs_bp.humanTurnLateralPaused = bool(getattr(CI.CC, "humanTurnLateralPaused", False))
     cs_bp.stallBlipActive = bool(getattr(CI.CC, "stallBlipActive", False))
+    cs_bp.angleSaturated = bool(getattr(CI.CC, "bp_angle_saturated", False))
 
     # BluePilot: settings snapshot -- refreshed at most every _SETTINGS_INTERVAL s so Params
     # reads don't add latency to every card.py tick.

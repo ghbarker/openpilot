@@ -2,8 +2,9 @@
 import random
 
 from opendbc.sunnypilot.car.ford.angle_autocal import (
-  AngleFactorEstimator, SteadyStateGate, speed_alpha,
+  AngleFactorEstimator, AutoCalPipeline, SteadyStateGate, speed_alpha,
   V_LOW, V_HIGH, LOW_ANCHOR_BASE, STEADY_TIME_S, MIN_KAPPA,
+  PRESS_HOLDBACK_S, PRESS_COOLDOWN_S, MAX_LAT_ACCEL,
 )
 
 PLATFORM_GAIN_HIGH = 1.05  # Mach-E
@@ -56,7 +57,9 @@ class TestAngleFactorEstimator:
     assert not est.add_sample(5.0, 0.002, 0.002)      # below speed threshold
     assert not est.add_sample(20.0, 0.002, -0.002)    # sign mismatch
     assert not est.add_sample(20.0, 0.002, 0.02)      # absurd ratio
+    assert not est.add_sample(29.0, 0.004, 0.004)     # 3.4 m/s^2 lat accel — car may not make this turn
     assert est.n == 0
+    assert est.add_sample(29.0, 0.0025, 0.0025)       # 2.1 m/s^2 — comfortably within tire limits
 
   def test_factor_clamp(self):
     est = AngleFactorEstimator(PLATFORM_GAIN_HIGH, 1.0, 1.0)
@@ -89,3 +92,65 @@ class TestSteadyStateGate:
     assert gate.update(True, 0.002, False, False, False, False, False)
     assert not gate.update(True, 0.004, False, False, False, False, False)  # jump
     assert gate.steady_s == 0.0
+
+  def test_saturation_blocks(self):
+    gate = SteadyStateGate(dt=0.05)
+    for _ in range(int(STEADY_TIME_S / 0.05) + 2):
+      assert not gate.update(True, 0.002, False, False, False, False, False, saturated=True)
+
+  def test_light_torque_starts_cooldown(self):
+    gate = SteadyStateGate(dt=0.05)
+    # Torque below the steeringPressed threshold but above the guard: hands are on.
+    gate.update(True, 0.002, False, False, False, False, False, driver_torque=0.7)
+    assert gate.grip_cooldown_s > 0.0
+    # Cooldown blocks sampling for PRESS_COOLDOWN_S after the grip ends.
+    blocked = int(PRESS_COOLDOWN_S / 0.05) - 1
+    for _ in range(blocked):
+      assert not gate.update(True, 0.002, False, False, False, False, False)
+
+
+def run_pipeline(pipe, n, torque=0.0, pressed=False, saturated=False, kappa=0.002, v=20.0):
+  committed = []
+  for _ in range(n):
+    committed += pipe.update(v, kappa, kappa, pressed, False, False, False, False,
+                             saturated=saturated, driver_torque=torque)
+  return committed
+
+
+class TestAutoCalPipeline:
+  def test_commits_after_holdback(self):
+    pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH, 1.0, 1.0)
+    warm = int((STEADY_TIME_S + PRESS_HOLDBACK_S) / 0.05) + 3
+    committed = run_pipeline(pipe, warm)
+    assert pipe.est.n > 0
+    assert len(committed) == pipe.est.n
+
+  def test_grip_cancels_staged_samples(self):
+    pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH, 1.0, 1.0)
+    # Reach eligibility, stage a few samples, but grip before the holdback elapses:
+    warm = int(STEADY_TIME_S / 0.05) + 1 + int(PRESS_HOLDBACK_S / 0.05) // 2
+    run_pipeline(pipe, warm)
+    assert len(pipe._staged) > 0 and pipe.est.n == 0
+    pipe.update(20.0, 0.002, 0.002, True, False, False, False, False)  # grip
+    assert len(pipe._staged) == 0
+    assert pipe.est.n == 0  # nothing from before the grip ever reached the estimator
+
+  def test_light_torque_also_cancels(self):
+    pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH, 1.0, 1.0)
+    warm = int(STEADY_TIME_S / 0.05) + 5
+    run_pipeline(pipe, warm)
+    assert len(pipe._staged) > 0
+    pipe.update(20.0, 0.002, 0.002, False, False, False, False, False, driver_torque=0.7)
+    assert len(pipe._staged) == 0 and pipe.est.n == 0
+
+  def test_saturated_frames_never_commit(self):
+    pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH, 1.0, 1.0)
+    committed = run_pipeline(pipe, 100, saturated=True)
+    assert committed == [] and pipe.est.n == 0
+
+  def test_idle_clears_staging(self):
+    pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH, 1.0, 1.0)
+    run_pipeline(pipe, int(STEADY_TIME_S / 0.05) + 5)
+    assert len(pipe._staged) > 0
+    pipe.idle()
+    assert len(pipe._staged) == 0 and pipe.gate.steady_s == 0.0
