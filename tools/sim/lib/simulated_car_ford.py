@@ -194,9 +194,12 @@ class FordSimulatedCar:
 
   def update(self, simulator_state: SimulatorState):
     try:
-      self._update_cruise(simulator_state)
-      self._update_plant(simulator_state)
-      self.send_can_messages(simulator_state)
+      # Before the MetaDrive world publishes its first state, velocity is None and
+      # simulator_state.speed raises — everything below must wait for valid.
+      if simulator_state.valid:
+        self._update_cruise(simulator_state)
+        self._update_plant(simulator_state)
+        self.send_can_messages(simulator_state)
       if self.idx % 50 == 0:
         self.send_panda_state(simulator_state)
       self.idx += 1
