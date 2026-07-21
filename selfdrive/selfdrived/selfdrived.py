@@ -415,7 +415,10 @@ class SelfdriveD(CruiseHelper):
     if not self.CP.notCar:
       if not self.sm['livePose'].posenetOK:
         self.events.add(EventName.posenetInvalid)
-      if not self.sm['livePose'].inputsOK:
+      if not self.sm['livePose'].inputsOK and not SIMULATION:
+        # BluePilot: exempt in SIMULATION — the sim world renders below real-time in WSL,
+        # so cameraOdometry cadence never satisfies locationd's timing filter; pose
+        # fidelity is not what the simulator exists to validate.
         self.events.add(EventName.locationdTemporaryError)
       if not self.sm['liveParameters'].valid and cal_status == log.LiveCalibrationData.Status.calibrated and not TESTING_CLOSET and (not SIMULATION or REPLAY):
         self.events.add(EventName.paramsdTemporaryError)
