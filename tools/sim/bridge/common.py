@@ -1,3 +1,4 @@
+import os
 import signal
 import threading
 import functools
@@ -101,7 +102,14 @@ Ignition: {self.simulator_state.ignition} Engaged: {self.simulator_state.is_enga
   def _run(self, q: Queue):
     self.world = self.spawn_world(q)
 
-    self.simulated_car = SimulatedCar()
+    # BluePilot: pick the simulated car from the forced fingerprint — a FORD fingerprint
+    # gets the Mach-E CAN-FD fake with the measured PSCM steering plant (closed over the
+    # real LateralMotionControl2 wire command instead of generic actuators).
+    if os.environ.get("FINGERPRINT", "").startswith("FORD"):
+      from openpilot.tools.sim.lib.simulated_car_ford import FordSimulatedCar
+      self.simulated_car = FordSimulatedCar()
+    else:
+      self.simulated_car = SimulatedCar()
     self.simulated_sensors = SimulatedSensors(self.dual_camera)
 
     self._exit_event = threading.Event()
@@ -175,7 +183,10 @@ Ignition: {self.simulator_state.ignition} Engaged: {self.simulator_state.is_enga
       if self.simulator_state.is_engaged:
         throttle_op = np.clip(self.simulated_car.sm['carControl'].actuators.accel / 1.6, 0.0, 1.0)
         brake_op = np.clip(-self.simulated_car.sm['carControl'].actuators.accel / 4.0, 0.0, 1.0)
-        steer_op = self.simulated_car.sm['carControl'].actuators.steeringAngleDeg
+        # BluePilot: the Ford fake steers through its PSCM plant (lagged response to the
+        # actual wire command); other cars keep the generic actuator angle.
+        plant_angle = getattr(self.simulated_car, "wheel_angle_deg", None)
+        steer_op = plant_angle if plant_angle is not None else self.simulated_car.sm['carControl'].actuators.steeringAngleDeg
 
         self.past_startup_engaged = True
       elif not self.past_startup_engaged and self.simulated_car.sm['selfdriveState'].engageable:
