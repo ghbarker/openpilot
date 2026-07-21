@@ -37,7 +37,7 @@ optional arguments:
 
 ## Forks
 
-openpilot forks can use this test with their own reference logs, by default `test_proccesses.py` saves logs locally.
+openpilot forks can use this test with their own reference logs, by default `test_processes.py` saves logs locally.
 
 To generate new logs:
 

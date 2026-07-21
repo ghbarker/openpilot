@@ -195,8 +195,56 @@ def main():
     print(f"next step: apply these factors (settings +/- or the onboard toggle), drive again, re-run this "
           f"tool — when the new recommendation moves less than {VERIFY_TOL:.2f}, it's verified and locks.")
 
+  here = os.path.dirname(os.path.abspath(__file__))
   write_report(ex, est, accepted, (low_new, high_new, stats), conv, g_high,
-               os.path.join(os.path.dirname(os.path.abspath(__file__)), "angle_autocal_report.html"))
+               os.path.join(here, "angle_autocal_report.html"))
+  write_replay(ex, est, low_new, high_new, g_high,
+               os.path.join(here, "angle_autocal_replay_template.html"),
+               os.path.join(here, "angle_autocal_replay.html"))
+
+
+def write_replay(ex, est, low_new, high_new, g_high, template_path, out_path):
+  """Dump the drive as a JS frame stream for the animated replay viewer.
+
+  Per angle-active frame: [t_rel, v, kappa_cmd, kappa_meas, kappa_sim_after, clean]
+  where kappa_sim_after applies the recommended factors' gain shift (first-order)
+  and clean marks frames free of grip/limit contamination.
+  """
+  import json
+  def gain_new(v):
+    a = speed_alpha(v)
+    return (1.0 - a) * (LOW_ANCHOR_BASE * low_new) + a * (g_high * high_new)
+
+  frames = []
+  t_acc, last_t = 0.0, None
+  for row in ex.rows:
+    if not row["lat_active"]:
+      last_t = None
+      continue
+    if last_t is not None:
+      t_acc += min(row["t"] - last_t, 0.5)  # compress gaps
+    last_t = row["t"]
+    shift = gain_new(row["v"]) / est.applied_gain(row["v"])
+    clean = not (row["pressed"] or row["human_turn"] or row["stall"]
+                 or row["saturated"] or row["angle_rate"] or row["deviation"])
+    frames.append([round(t_acc, 2), round(row["v"], 1),
+                   round(row["kappa_cmd"], 5), round(row["kappa_meas"], 5),
+                   round(row["kappa_meas"] * shift, 5), 1 if clean else 0])
+  payload = dict(
+    fingerprint=ex.fingerprint,
+    low_old=ex.low_factor, high_old=ex.high_factor,
+    low_new=round(low_new, 2), high_new=round(high_new, 2),
+    frames=frames,
+  )
+  # Inline the frame stream into the template -> a single self-contained HTML file
+  # that opens from anywhere (Explorer double-click, the bat, the browser pane).
+  with open(template_path, encoding="utf-8") as f:
+    html = f.read()
+  data_tag = "<script>const DRIVE = " + json.dumps(payload, separators=(",", ":")) + ";</script>"
+  html = html.replace('<script src="angle_autocal_frames.js"></script>', data_tag)
+  with open(out_path, "w", encoding="utf-8") as f:
+    f.write(html)
+  print(f"replay viewer: {out_path} ({len(frames)} frames, {os.path.getsize(out_path)//1024//1024} MB, self-contained)")
 
 
 def write_report(ex, est, accepted, result, converged, g_high, out_path):

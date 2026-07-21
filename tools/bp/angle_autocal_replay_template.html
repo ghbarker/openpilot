@@ -1,0 +1,145 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Angle auto-cal — drive replay</title>
+<style>
+  body { background:#101216; color:#ddd; font-family:system-ui; margin:0; display:flex; flex-direction:column; align-items:center; }
+  #hud { display:flex; gap:28px; align-items:baseline; margin:10px 0 4px; }
+  #hud b { font-size:26px; }
+  #legend span { margin-right:18px; font-size:13px; }
+  canvas { background:#0b0d10; border-radius:10px; margin:6px 0; }
+  #bar { width:960px; display:flex; gap:10px; align-items:center; margin-bottom:14px; }
+  #scrub { flex:1; }
+  button { background:#232833; color:#ddd; border:0; border-radius:6px; padding:6px 14px; font-size:14px; cursor:pointer; }
+  button:hover { background:#2f3644; }
+  .ratio { font-variant-numeric:tabular-nums; }
+</style>
+<div id="hud">
+  <b id="mph">0</b><span>mph</span>
+  <span class="ratio">turn delivered: <b id="rb" style="color:#e4781c">–</b> now
+    → <b id="ra" style="color:#3fbf6f">–</b> calibrated</span>
+  <span id="clock">0:00</span>
+  <span id="facts" style="color:#889"></span>
+</div>
+<div id="legend">
+  <span style="color:#ccc">━ requested path</span>
+  <span style="color:#e4781c">━ your car (this drive)</span>
+  <span style="color:#3fbf6f">━ with calibrated factors (simulated)</span>
+  <span style="color:#556" id="dirty"></span>
+  <span style="color:#445">curvature exaggerated 2.5× for visibility</span>
+</div>
+<canvas id="road" width="960" height="470"></canvas>
+<div id="bar">
+  <button id="play">▶</button>
+  <button id="spd">4×</button>
+  <button id="curve">next curve ⏭</button>
+  <button id="skip" title="fast-forward straights automatically">skip straights: on</button>
+  <input id="scrub" type="range" min="0" max="1000" value="0">
+</div>
+<script src="angle_autocal_frames.js"></script>
+<script>
+const F = DRIVE.frames, N = F.length;
+document.getElementById("facts").textContent =
+  `${DRIVE.fingerprint} — factors ${DRIVE.low_old.toFixed(2)}/${DRIVE.high_old.toFixed(2)} → ${DRIVE.low_new.toFixed(2)}/${DRIVE.high_new.toFixed(2)}`;
+const cv = document.getElementById("road"), ctx = cv.getContext("2d");
+const W = cv.width, H = cv.height, HORIZON = H * 0.36, CAM_H = 1.35, FOV = 1.05, EXAG = 2.5;
+
+let i = 0, playing = false, speedIdx = 1, skipStraights = true;
+const SPEEDS = [1, 4, 16];
+let smooth = { c: 0, m: 0, a: 0 };
+
+function project(d, x) {
+  // simple pinhole: forward d meters, lateral x meters -> screen
+  const z = Math.max(d, 1.2);
+  const sy = HORIZON + (H - HORIZON) * (CAM_H / z) * 2.4;
+  const sx = W / 2 + (x / z) * (W / FOV) * 0.9;
+  return [sx, Math.min(sy, H)];
+}
+
+function ribbon(kappa, color, width, alpha) {
+  ctx.beginPath();
+  let started = false;
+  for (let d = 2; d <= 70; d += 2) {
+    const x = 0.5 * kappa * d * d * EXAG;    // arc approximation, laterally exaggerated for visibility
+    const [sx, sy] = project(d, x);
+    if (!started) { ctx.moveTo(sx, sy); started = true; } else { ctx.lineTo(sx, sy); }
+  }
+  ctx.strokeStyle = color; ctx.globalAlpha = alpha; ctx.lineWidth = width;
+  ctx.lineCap = "round"; ctx.stroke(); ctx.globalAlpha = 1;
+}
+
+function draw() {
+  const f = F[Math.min(i, N - 1)];
+  const [t, v, kc, km, ka, clean] = f;
+  // low-pass for visual smoothness at high playback speeds
+  const lp = 0.25;
+  smooth.c += lp * (kc - smooth.c);
+  smooth.m += lp * (km - smooth.m);
+  smooth.a += lp * (ka - smooth.a);
+
+  ctx.clearRect(0, 0, W, H);
+  // sky + ground
+  ctx.fillStyle = "#0d1017"; ctx.fillRect(0, 0, W, HORIZON);
+  ctx.fillStyle = "#0b0d10"; ctx.fillRect(0, HORIZON, W, H - HORIZON);
+  ctx.strokeStyle = "#1d2330"; ctx.beginPath();
+  ctx.moveTo(0, HORIZON); ctx.lineTo(W, HORIZON); ctx.stroke();
+
+  // lane edges relative to requested path for context
+  ctx.setLineDash([14, 18]);
+  ribbon(smooth.c, "#39414f", 3, 0.9);
+  ctx.setLineDash([]);
+  ribbon(smooth.c, "#cccccc", 5, 0.95);
+  ribbon(smooth.m, "#e4781c", 9, 0.8);
+  ribbon(smooth.a, "#3fbf6f", 5, 0.95);
+
+  // HUD
+  document.getElementById("mph").textContent = Math.round(v * 2.237);
+  const mins = Math.floor(t / 60), secs = Math.floor(t % 60);
+  document.getElementById("clock").textContent = `${mins}:${String(secs).padStart(2, "0")}`;
+  const inCurve = Math.abs(smooth.c) > 0.001;
+  document.getElementById("rb").textContent = inCurve ? (smooth.m / smooth.c).toFixed(2) + "×" : "–";
+  document.getElementById("ra").textContent = inCurve ? (smooth.a / smooth.c).toFixed(2) + "×" : "–";
+  document.getElementById("dirty").textContent = clean ? "" : "· grip/limit — not used for calibration";
+  document.getElementById("scrub").value = Math.round(1000 * i / (N - 1));
+}
+
+function step() {
+  if (!playing) return;
+  let adv = SPEEDS[speedIdx];
+  if (skipStraights && Math.abs(F[Math.min(i, N - 1)][2]) < 0.0006) adv = Math.max(adv, 40);
+  i += adv;
+  if (i >= N) { i = N - 1; playing = false; document.getElementById("play").textContent = "▶"; }
+  draw();
+  requestAnimationFrame(step);
+}
+
+document.getElementById("play").onclick = () => {
+  playing = !playing;
+  document.getElementById("play").textContent = playing ? "❚❚" : "▶";
+  if (playing) { if (i >= N - 1) i = 0; requestAnimationFrame(step); }
+};
+document.getElementById("spd").onclick = (e) => {
+  speedIdx = (speedIdx + 1) % SPEEDS.length;
+  e.target.textContent = SPEEDS[speedIdx] + "×";
+};
+document.getElementById("skip").onclick = (e) => {
+  skipStraights = !skipStraights;
+  e.target.textContent = "skip straights: " + (skipStraights ? "on" : "off");
+};
+document.getElementById("curve").onclick = () => {
+  // find the next sustained curve: 1s of |kappa| above threshold
+  let j = i + 20, run = 0;
+  while (j < N - 1) {
+    run = Math.abs(F[j][2]) >= 0.0015 ? run + 1 : 0;
+    if (run >= 20) { j -= 15; break; }
+    j++;
+  }
+  i = j; smooth = { c: F[i][2], m: F[i][3], a: F[i][4] }; draw();
+};
+document.getElementById("scrub").oninput = (e) => {
+  i = Math.round((N - 1) * e.target.value / 1000);
+  smooth = { c: F[i][2], m: F[i][3], a: F[i][4] };
+  draw();
+};
+document.body.onkeydown = (e) => { if (e.code === "Space") { e.preventDefault(); document.getElementById("play").click(); } };
+draw();
+</script>
