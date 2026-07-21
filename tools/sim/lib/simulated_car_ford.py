@@ -164,7 +164,10 @@ class FordSimulatedCar:
       "CcStat_D_Actl": 5 if self.cruise_enabled else 3,   # 3 = standby/available, 5 = active
       "Veh_V_DsplyCcSet": 65,                             # cruise setpoint display (kph)
     }))
-    msg.append(self.packer.make_can_msg("Cluster_Info1_FD1", 0, {"DrvSlipCtlMde_D_Rq": 0}))
+    msg.append(self.packer.make_can_msg("Cluster_Info1_FD1", 0, {
+      "DrvSlipCtlMde_D_Rq": 0,
+      "AccEnbl_B_RqDrv": 1,   # adaptive cruise mode selected (0 -> nonAdaptive -> wrongCruiseMode)
+    }))
     msg.append(self.packer.make_can_msg("Cluster_Info_3_FD1", 0, {"DISPLAY_SPEED_SCALING": 100}))
     msg.append(self.packer.make_can_msg("EPAS_INFO", 0, {
       "SteeringColumnTorque": ss.user_torque,
