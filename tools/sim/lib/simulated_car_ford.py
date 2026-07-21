@@ -187,6 +187,13 @@ class FordSimulatedCar:
     if self.params.get_bool("ObdMultiplexingEnabled") != self.obd_multiplexing:
       self.obd_multiplexing = not self.obd_multiplexing
       self.params.put_bool("ObdMultiplexingChanged", True, block=True)
+    # Mirror the safety config carParams expects — selfdrived raises controlsMismatch
+    # forever on any difference (model or param), which blocks engagement.
+    safety_model, safety_param = 'ford', FordSafetyFlags.CANFD.value
+    cp = self.sm["carParams"]
+    if len(cp.safetyConfigs):
+      safety_model = str(cp.safetyConfigs[-1].safetyModel)
+      safety_param = cp.safetyConfigs[-1].safetyParam
     dat = messaging.new_message('pandaStates', 1)
     dat.valid = True
     dat.pandaStates[0] = {
@@ -195,9 +202,9 @@ class FordSimulatedCar:
       'controlsAllowed': True,
       'controlsAllowedLateral': True,
       'controlsAllowedLongitudinal': True,
-      'safetyModel': 'ford',
-      'alternativeExperience': self.sm["carParams"].alternativeExperience,
-      'safetyParam': FordSafetyFlags.CANFD.value,
+      'safetyModel': safety_model,
+      'alternativeExperience': cp.alternativeExperience,
+      'safetyParam': safety_param,
     }
     self.pm.send('pandaStates', dat)
 
