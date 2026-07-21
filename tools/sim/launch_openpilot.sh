@@ -13,10 +13,11 @@ if [[ "$CI" ]]; then
   export BLOCK="${BLOCK},ui"
 fi
 
-# BluePilot: MadsUnifiedEngagementMode — with fresh sim params, MADS' default blocks
-# unified engagement and silently ERASES pcmEnable/buttonEnable events, so the stack
-# can never engage regardless of cruise edges or button presses.
-python3 -c "from openpilot.selfdrive.test.helpers import set_params_enabled; from openpilot.common.params import Params; set_params_enabled(); Params().put_bool('MadsUnifiedEngagementMode', True)"
+# BluePilot: disable MADS in the simulator — MADS self-engages lateral as soon as
+# cruise reports available, and while it is enabled block_unified_engagement_mode()
+# ERASES pcmEnable/buttonEnable, so full engagement can never occur. The sim judges
+# the lateral controller itself; stock engagement is what it needs.
+python3 -c "from openpilot.selfdrive.test.helpers import set_params_enabled; from openpilot.common.params import Params; set_params_enabled(); Params().put_bool('Mads', False)"
 
 SCRIPT_DIR=$(dirname "$0")
 OPENPILOT_DIR=$SCRIPT_DIR/../../
