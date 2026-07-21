@@ -27,29 +27,21 @@ from numpy import clip, interp
 from opendbc.car import DT_CTRL
 from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.ford.values import CAR, CarControllerParams
+from opendbc.sunnypilot.car.ford.angle_autocal import AngleFactorEstimator, SteadyStateGate
 from opendbc.sunnypilot.car.ford.lateral_curv_ext import LateralResult
 from opendbc.sunnypilot.car.ford.human_turn import HumanTurnDetector
 from opendbc.sunnypilot.car.ford.values_ext import BP_ANGLE_LIMITS
 from selfdrive.modeld.constants import ModelConstants
 
-# Hard-coded per-platform gain defaults (not user-tunable).
-# CAN vehicles (Escape MK4, Bronco Sport, Explorer, Maverick, Edge)
-_GAIN_CAN         = (1.00, 1.15)
-# CAN-FD body-on-frame trucks (F-150, Lightning, Expedition, Ranger)
-_GAIN_CANFD_BOF   = (0.95, 0.95)
-# CAN-FD unibody SUVs (Mustang Mach-E, Escape MK4.5)
-_GAIN_CANFD_SUV   = (1.00, 1.05)
-
-_CANFD_BOF_CARS = frozenset({
-  CAR.FORD_F_150_MK14,
-  CAR.FORD_F_150_LIGHTNING_MK1,
-  CAR.FORD_EXPEDITION_MK4,
-  CAR.FORD_RANGER_MK2,
-})
-_CANFD_SUV_CARS = frozenset({
-  CAR.FORD_MUSTANG_MACH_E_MK1,
-  CAR.FORD_ESCAPE_MK4_5,
-})
+# Hard-coded per-platform gain defaults (not user-tunable). Single source lives in
+# angle_autocal.py so the offline analyzer and the auto-calibrator share them.
+from opendbc.sunnypilot.car.ford.angle_autocal import (  # noqa: E402
+  GAIN_CAN as _GAIN_CAN,
+  GAIN_CANFD_BOF as _GAIN_CANFD_BOF,
+  GAIN_CANFD_SUV as _GAIN_CANFD_SUV,
+  CANFD_BOF_CARS as _CANFD_BOF_CARS,
+  CANFD_SUV_CARS as _CANFD_SUV_CARS,
+)
 
 
 # DBC ``LatCtlPath_An_Actl`` (rad) — panda safety uses the same in ``ford.h``; PSCM enforces in firmware.
@@ -171,6 +163,16 @@ class LateralAngleExt:
     self.stall_blip_count = 0         # pulses fired this stall episode
     self.angle_stall_blip_active = False
     self.press_timer_s = 0.0          # continuous steeringPressed time, for the hand-off blip
+    # BluePilot: one-time auto-calibration of the speed factors (see angle_autocal.py).
+    # Enabled by FordAngleAutoCal; FordAngleAutoCalState empty = collecting, "done ..." = locked.
+    # The values are per-car constants, so once converged the factors are written and the
+    # calibrator never runs again (toggling the setting off clears the state to allow a re-run).
+    self.autocal_enabled = False
+    self.autocal_done = True  # conservative until params are read
+    self.autocal_est = None
+    self.autocal_gate = None
+    self._autocal_param_ctr = 0
+    self._autocal_params_handle = None
 
   def update_angle_params(self, params):
     """Sets per-platform gain defaults and reads user feel-factor params."""
@@ -201,6 +203,33 @@ class LateralAngleExt:
             float(raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw), 0.85, 1.50))
       except Exception:
         pass
+      # BluePilot: auto-calibration arm/disarm (checked ~1 Hz; this method runs at 100 Hz)
+      self._autocal_param_ctr += 1
+      if self._autocal_param_ctr >= 100 or self.autocal_gate is None:
+        self._autocal_param_ctr = 0
+        try:
+          enabled = bool(params.get_bool("FordAngleAutoCal"))
+          state = params.get("FordAngleAutoCalState", return_default=True) or ""
+          if isinstance(state, bytes):
+            state = state.decode("utf-8", errors="replace")
+          self.autocal_done = state.startswith("done")
+          self.autocal_enabled = enabled and not self.autocal_done
+          # (Re)build the estimator when arming, and restart it if the user hand-changes a
+          # factor mid-collection — samples are relative to the factors in force when taken.
+          factors_changed = (self.autocal_est is not None and
+                             (abs(self.autocal_est.low_factor_applied - self.low_speed_curv_factor) > 1e-6 or
+                              abs(self.autocal_est.high_factor_applied - self.high_speed_curv_factor) > 1e-6))
+          if self.autocal_enabled and (self.autocal_est is None or factors_changed):
+            self.autocal_est = AngleFactorEstimator(self.path_angle_gain_highC_highV,
+                                                    self.low_speed_curv_factor,
+                                                    self.high_speed_curv_factor)
+            self.autocal_gate = SteadyStateGate(dt=_STEER_DT)
+          elif not self.autocal_enabled:
+            self.autocal_est = None
+            self.autocal_gate = None
+          self._autocal_params_handle = params
+        except Exception:
+          self.autocal_enabled = False
 
   def update_angle_strategy(self, CC, CS, actuators, CP):
     """
@@ -246,6 +275,8 @@ class LateralAngleExt:
       self.angle_stall_blip_active = False
       self.press_timer_s = 0.0
       self.precision_type = 1
+      if self.autocal_gate is not None:  # steady-state timer must not span disengagements
+        self.autocal_gate.update(False, 0.0, False, False, False, False, False)
       return LateralResult(
         apply_curvature=0.0,
         curvature_rate=0.0,
@@ -289,6 +320,8 @@ class LateralAngleExt:
       self.angle_stall_blip_active = False
       self.press_timer_s = 0.0
       self.precision_type = 1
+      if self.autocal_gate is not None:  # steady-state timer must not span disengagements
+        self.autocal_gate.update(False, 0.0, False, False, False, False, False)
       return LateralResult(
         apply_curvature=0.0,
         curvature_rate=0.0,
@@ -555,6 +588,17 @@ class LateralAngleExt:
 
     ramp_type = 2
 
+    # BluePilot: one-time auto-calibration — feed steady engaged curves to the estimator and,
+    # on convergence, write the corrected factors once and lock. kappa_cmd here is the exact
+    # post-clip curvature path_angle was derived from; current_curvature is the same measured
+    # value the strategy itself steers against.
+    if self.autocal_enabled and self.autocal_est is not None and self.autocal_gate is not None:
+      if self.autocal_gate.update(True, kappa_cmd, CS.out.steeringPressed,
+                                  self.bp_angle_rate_limited, self.bp_curvature_deviation_limited,
+                                  self.angle_human_turn_active, self.angle_stall_blip_active):
+        self.autocal_est.add_sample(v_ego, kappa_cmd, current_curvature, weight=_STEER_DT)
+        if self.autocal_est.n % 20 == 0 and self.autocal_est.converged():
+          self._autocal_finish()
 
     return LateralResult(
       apply_curvature=0.0,
@@ -565,3 +609,26 @@ class LateralAngleExt:
       precision_type=self.precision_type,
       lateralUncertainty=lateral_uncertainty,
     )
+
+  def _autocal_finish(self):
+    """Write the converged factors and lock the calibration (one-time, per-car)."""
+    result = self.autocal_est.solve()
+    if result is None or self._autocal_params_handle is None:
+      return
+    low_new, high_new, stats = result
+    try:
+      self._autocal_params_handle.put("FordLowSpeedFactor_ang", f"{low_new:.2f}")
+      self._autocal_params_handle.put("FordHighSpeedFactor_ang", f"{high_new:.2f}")
+      self._autocal_params_handle.put(
+        "FordAngleAutoCalState",
+        f"done low={low_new:.2f} high={high_new:.2f} n={stats['n']} "
+        f"se={stats['stderr_low']:.3f}/{stats['stderr_high']:.3f}")
+    except Exception:
+      return
+    # Apply immediately so this drive benefits without waiting for the param round-trip.
+    self.low_speed_curv_factor = float(low_new)
+    self.high_speed_curv_factor = float(high_new)
+    self.autocal_done = True
+    self.autocal_enabled = False
+    self.autocal_est = None
+    self.autocal_gate = None
