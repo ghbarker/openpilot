@@ -73,20 +73,34 @@ class FordSimulatedCar:
     # fake must latch it from the bridge's button presses (Honda CruiseButtons values:
     # 1=MAIN, 2=CANCEL, 3=DECEL_SET, 4=RES_ACCEL) or openpilot waits forever.
     self.cruise_enabled = False
+    self._cruise_unengaged_frames = 0
+    self._cruise_drop_frames = 0
 
   # ------------------------------------------------------------------
   # Wire command -> PSCM plant
   # ------------------------------------------------------------------
 
   def _update_cruise(self, ss: SimulatorState):
+    # pcmCruise engagement is edge-triggered, and the first rising edge usually lands
+    # inside the boot-time veto storm and is consumed unengaged. A real PCM holds cruise
+    # steady; this fake adds patient retry: if openpilot hasn't engaged ~1.5s after
+    # cruise latched, drop cruise briefly and let the bridge's SET press produce a fresh
+    # rising edge on a clean event board. Stops as soon as engagement sticks.
+    if self._cruise_drop_frames > 0:
+      self._cruise_drop_frames -= 1
+      self.cruise_enabled = False
+      return
     if ss.cruise_button in (3, 4):    # SET / RESUME
       self.cruise_enabled = True
-    elif ss.cruise_button in (1, 2) or ss.user_brake > 0:  # MAIN toggle-off / CANCEL / brake
-      # MAIN dropping cruise matters: pcmCruise engagement is edge-triggered, and the
-      # bridge's alternating MAIN/SET presses rely on MAIN producing the falling edge
-      # so the next SET produces a fresh rising edge (the boot-time edge lands during
-      # the startup veto storm and is consumed unengaged).
+    elif ss.cruise_button == 2 or ss.user_brake > 0:  # CANCEL or brake
       self.cruise_enabled = False
+    if ss.is_engaged:
+      self._cruise_unengaged_frames = 0
+    elif self.cruise_enabled:
+      self._cruise_unengaged_frames += 1
+      if self._cruise_unengaged_frames > 150:   # 1.5 s at 100 Hz
+        self._cruise_unengaged_frames = 0
+        self._cruise_drop_frames = 30           # 300 ms clean falling edge
 
   def _update_plant(self, simulator_state: SimulatorState):
     raws = messaging.drain_sock_raw(self.can_sock)
