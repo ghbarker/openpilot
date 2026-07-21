@@ -154,3 +154,18 @@ class TestAutoCalPipeline:
     assert len(pipe._staged) > 0
     pipe.idle()
     assert len(pipe._staged) == 0 and pipe.gate.steady_s == 0.0
+
+  def test_unsettled_measurement_not_staged(self):
+    # Command steady but the car still converging toward it (closed-loop compensation
+    # tail): those frames must not be sampled even though the command gate passes.
+    pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH, 1.0, 1.0)
+    warm = int((STEADY_TIME_S + PRESS_HOLDBACK_S) / 0.05) + 10
+    kappa_meas = 0.0010  # far from the 0.002 command, sweeping up fast
+    staged_during_sweep = 0
+    for _ in range(warm):
+      pipe.update(20.0, 0.002, kappa_meas, False, False, False, False, False)
+      if kappa_meas < 0.0019:
+        kappa_meas += 0.0002  # 0.004/s sweep, far above the settle bound
+        staged_during_sweep = len(pipe._staged) + pipe.est.n
+    assert staged_during_sweep == 0  # nothing accepted while the car was still turning in
+    assert pipe.est.n > 0            # but samples flow once the measurement settles

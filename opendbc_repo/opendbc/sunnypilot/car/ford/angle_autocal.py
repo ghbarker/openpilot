@@ -270,11 +270,13 @@ class AutoCalPipeline:
     self.gate = SteadyStateGate(dt=dt)
     self.dt = dt
     self._staged: list[list] = []  # [age_s, v, kappa_cmd, kappa_meas]
+    self._meas_last = None
 
   def idle(self):
     """Call on frames where lateral is inactive (disengaged / human-turn override)."""
     self.gate.update(False, 0.0, False, False, False, False, False)
     self._staged.clear()
+    self._meas_last = None
 
   def update(self, v_ego: float, kappa_cmd: float, kappa_meas: float,
              steering_pressed: bool, angle_rate_limited: bool, deviation_limited: bool,
@@ -291,6 +293,14 @@ class AutoCalPipeline:
                                 angle_rate_limited, deviation_limited,
                                 human_turn, stall_blip,
                                 saturated=saturated, driver_torque=driver_torque)
+
+    # The CAR must be settled too, not just the command: during closed-loop compensation
+    # swings (understeer -> harder request -> convergence tail) the command can sit steady
+    # while the measurement is still moving toward it — those ratios are transient, not
+    # gain. Measured curvature is noisier than the command, so the bound is 3x looser.
+    if eligible and self._meas_last is not None:
+      eligible = abs(kappa_meas - self._meas_last) / self.dt <= 3.0 * MAX_KAPPA_RATE
+    self._meas_last = kappa_meas
 
     # Age the staging queue; entries that survived the holdback graduate to the estimator.
     committed = []
