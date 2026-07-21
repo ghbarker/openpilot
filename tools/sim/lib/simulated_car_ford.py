@@ -151,6 +151,9 @@ class FordSimulatedCar:
     }))
 
     # *** camera bus (2): stock IPMA chatter the cam parser expects ***
+    # LateralMotionControl2 at its 8-byte DBC size is also the interface's "not a
+    # TRON/SecOC platform" proof (16 bytes there -> dashcamOnly).
+    msg.append(self.packer.make_can_msg("LateralMotionControl2", 2, {}))
     msg.append(self.packer.make_can_msg("ACCDATA", 2, {}))
     msg.append(self.packer.make_can_msg("ACCDATA_2", 2, {}))
     msg.append(self.packer.make_can_msg("ACCDATA_3", 2, {}))
