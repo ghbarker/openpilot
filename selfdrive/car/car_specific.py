@@ -178,15 +178,8 @@ class CarSpecificEvents:
 
     # we engage when pcm is active (rising edge)
     # enabling can optionally be blocked by the car interface
-    # DEBUG-SIM (temporary, revert): trace the pcm engagement decision
-    self._dbg_ctr = getattr(self, "_dbg_ctr", 0) + 1
-    if self._dbg_ctr % 100 == 0:
-      from openpilot.common.swaglog import cloudlog
-      cloudlog.error(f"DBGPCM pcm_enable={pcm_enable} cruise={CS.cruiseState.enabled} prev={CS_prev.cruiseState.enabled} block={CS.blockPcmEnable}")
     if pcm_enable:
       if CS.cruiseState.enabled and not CS_prev.cruiseState.enabled and not CS.blockPcmEnable:
-        from openpilot.common.swaglog import cloudlog
-        cloudlog.error("DBGPCM pcmEnable EDGE FIRED")
         events.add(EventName.pcmEnable)
       elif not CS.cruiseState.enabled:
         events.add(EventName.pcmDisable)
