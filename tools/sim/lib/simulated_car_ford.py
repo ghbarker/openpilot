@@ -81,7 +81,11 @@ class FordSimulatedCar:
   def _update_cruise(self, ss: SimulatorState):
     if ss.cruise_button in (3, 4):    # SET / RESUME
       self.cruise_enabled = True
-    elif ss.cruise_button == 2 or ss.user_brake > 0:  # CANCEL or brake
+    elif ss.cruise_button in (1, 2) or ss.user_brake > 0:  # MAIN toggle-off / CANCEL / brake
+      # MAIN dropping cruise matters: pcmCruise engagement is edge-triggered, and the
+      # bridge's alternating MAIN/SET presses rely on MAIN producing the falling edge
+      # so the next SET produces a fresh rising edge (the boot-time edge lands during
+      # the startup veto storm and is consumed unengaged).
       self.cruise_enabled = False
 
   def _update_plant(self, simulator_state: SimulatorState):
