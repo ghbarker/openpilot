@@ -170,6 +170,9 @@ class FordSimulatedCar:
     msg.append(self.packer.make_can_msg("IPMA_Data", 2, {}))
     msg.append(self.packer.make_can_msg("IPMA_Data2", 2, {"IsaVLimUnit_D_Rq": 0}))
     msg.append(self.packer.make_can_msg("Traffic_RecognitnData", 2, {}))
+    # Mach-E has BSM: the cam parser requires the side radars (5 Hz on the real car)
+    msg.append(self.packer.make_can_msg("Side_Detect_L_Stat", 2, {}))
+    msg.append(self.packer.make_can_msg("Side_Detect_R_Stat", 2, {}))
 
     self.pm.send('can', can_list_to_can_capnp(msg))
 
