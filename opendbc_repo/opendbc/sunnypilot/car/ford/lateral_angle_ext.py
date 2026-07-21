@@ -172,7 +172,8 @@ class LateralAngleExt:
     self.autocal_enabled = False
     self.autocal_done = True  # conservative until params are read
     self.autocal = None       # AutoCalPipeline while collecting
-    self._autocal_param_ctr = 0
+    self._autocal_round = 1
+    self._autocal_param_ctr = 100  # >= threshold so the very first call reads params
     self._autocal_params_handle = None
     # Telemetry + autocal gate: the command this frame was modified by PSCM authority
     # limits or the DBC clamp — the car could not make the requested turn.
@@ -209,7 +210,7 @@ class LateralAngleExt:
         pass
       # BluePilot: auto-calibration arm/disarm (checked ~1 Hz; this method runs at 100 Hz)
       self._autocal_param_ctr += 1
-      if self._autocal_param_ctr >= 100 or self.autocal_gate is None:
+      if self._autocal_param_ctr >= 100:
         self._autocal_param_ctr = 0
         try:
           enabled = bool(params.get_bool("FordAngleAutoCal"))

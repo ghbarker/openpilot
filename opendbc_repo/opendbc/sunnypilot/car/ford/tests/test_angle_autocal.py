@@ -1,6 +1,8 @@
 """Tests for the one-time angle-mode factor auto-calibration (angle_autocal.py)."""
 import random
 
+import pytest
+
 from opendbc.sunnypilot.car.ford.angle_autocal import (
   AngleFactorEstimator, AutoCalPipeline, SteadyStateGate, speed_alpha,
   V_LOW, V_HIGH, LOW_ANCHOR_BASE, STEADY_TIME_S, MIN_KAPPA,
@@ -169,3 +171,71 @@ class TestAutoCalPipeline:
         staged_during_sweep = len(pipe._staged) + pipe.est.n
     assert staged_during_sweep == 0  # nothing accepted while the car was still turning in
     assert pipe.est.n > 0            # but samples flow once the measurement settles
+
+
+class _MockParams:
+  """Duck-typed openpilot Params: just enough for update_angle_params."""
+  def __init__(self, values):
+    self.values = values
+    self.written = {}
+
+  def get(self, key, return_default=False):
+    return self.values.get(key)
+
+  def get_bool(self, key):
+    return bool(self.values.get(key))
+
+  def put(self, key, value):
+    self.written[key] = value
+
+
+class TestOnboardGlue:
+  """Exercise the REAL LateralAngleExt param/arming glue — the seam unit tests of the
+  pipeline cannot see. This is the test that would have caught the autocal_gate
+  AttributeError that crashed card on-device while every component test passed."""
+
+  def _ext(self):
+    messaging = pytest.importorskip("cereal.messaging")  # noqa: F841  (linux-only)
+    from opendbc.sunnypilot.car.ford.lateral_angle_ext import LateralAngleExt
+
+    class _Harness(LateralAngleExt):
+      # In the real CarController this comes from the LateralCurvExt mixin, where it is
+      # a no-op compatibility shim (state is initialized eagerly). Same no-op here.
+      def _ensure_lateral_curv_initialized(self, CP):
+        pass
+
+    ext = _Harness()
+    class _CP:
+      carFingerprint = "FORD_MUSTANG_MACH_E_MK1"
+    ext.CP = _CP()
+    return ext
+
+  def test_param_glue_runs_without_error(self):
+    ext = self._ext()
+    p = _MockParams({"FordAngleAutoCal": 0, "FordAngleAutoCalState": ""})
+    for _ in range(205):  # spans two 100-call read cycles including the first-call read
+      ext.update_angle_params(p)
+    assert ext.autocal is None and not ext.autocal_enabled
+
+  def test_arming_builds_pipeline(self):
+    ext = self._ext()
+    p = _MockParams({"FordAngleAutoCal": 1, "FordAngleAutoCalState": "",
+                     "FordLowSpeedFactor_ang": "1.10", "FordHighSpeedFactor_ang": "0.95"})
+    ext.update_angle_params(p)
+    assert ext.autocal_enabled and ext.autocal is not None
+    assert abs(ext.autocal.est.low_factor_applied - 1.10) < 1e-6
+    assert abs(ext.autocal.est.high_factor_applied - 0.95) < 1e-6
+    assert ext._autocal_round == 1
+
+  def test_done_state_never_arms(self):
+    ext = self._ext()
+    p = _MockParams({"FordAngleAutoCal": 1, "FordAngleAutoCalState": "done low=1.02 high=1.15"})
+    ext.update_angle_params(p)
+    assert ext.autocal is None and ext.autocal_done and not ext.autocal_enabled
+
+  def test_round_number_survives_restart(self):
+    ext = self._ext()
+    p = _MockParams({"FordAngleAutoCal": 1,
+                     "FordAngleAutoCalState": "round 3 collecting; applied low=1.05 high=1.10"})
+    ext.update_angle_params(p)
+    assert ext._autocal_round == 3 and ext.autocal_enabled
