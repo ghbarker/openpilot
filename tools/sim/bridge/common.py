@@ -39,6 +39,9 @@ class SimulatorBridge(ABC):
   TICKS_PER_FRAME = 5
 
   def __init__(self, dual_camera, high_quality):
+    # BluePilot: set_params_enabled() STOMPS the FINGERPRINT env (test helper hardcodes a
+    # Toyota); capture the launcher's choice first — it selects the simulated car below.
+    self.sim_fingerprint = os.environ.get("FINGERPRINT", "")
     set_params_enabled()
     self.params = Params()
     self.params.put_bool("AlphaLongitudinalEnabled", True, block=True)
@@ -105,13 +108,12 @@ Ignition: {self.simulator_state.ignition} Engaged: {self.simulator_state.is_enga
     # BluePilot: pick the simulated car from the forced fingerprint — a FORD fingerprint
     # gets the Mach-E CAN-FD fake with the measured PSCM steering plant (closed over the
     # real LateralMotionControl2 wire command instead of generic actuators).
-    sim_fp = os.environ.get("FINGERPRINT", "")
-    if sim_fp.startswith("FORD"):
+    if self.sim_fingerprint.startswith("FORD"):
       from openpilot.tools.sim.lib.simulated_car_ford import FordSimulatedCar
       self.simulated_car = FordSimulatedCar()
     else:
       self.simulated_car = SimulatedCar()
-    print(f"simulated car: {type(self.simulated_car).__name__} (FINGERPRINT={sim_fp!r})", flush=True)
+    print(f"simulated car: {type(self.simulated_car).__name__} (FINGERPRINT={self.sim_fingerprint!r})", flush=True)
     self.simulated_sensors = SimulatedSensors(self.dual_camera)
 
     self._exit_event = threading.Event()
