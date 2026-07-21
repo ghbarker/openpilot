@@ -152,12 +152,13 @@ class FordSimulatedCar:
     }))
     msg.append(self.packer.make_can_msg("SteeringPinion_Data", 0, {
       "StePinComp_An_Est": self.wheel_angle_deg,          # the lagged PSCM plant angle
+      "StePinCompAnEst_D_Qf": 3,                          # quality good (else vehicleSensorsInvalid)
     }))
     msg.append(self.packer.make_can_msg("Lane_Assist_Data3_FD1", 0, {
       "LatCtlSte_D_Stat": 2 if self.lat_mode != 0 else 1,  # active / ready (not-faulted set)
     }))
     msg.append(self.packer.make_can_msg("Gear_Shift_by_Wire_FD1", 0, {
-      "TrnRng_D_RqGsm": 4,  # Drive
+      "TrnRng_D_RqGsm": 3,  # Drive (4 is Sport — see the DBC VAL_ table)
     }))
     msg.append(self.packer.make_can_msg("PowertrainData_10", 0, {}))  # required for automatics
 
