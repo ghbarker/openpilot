@@ -73,8 +73,8 @@ class FordSimulatedCar:
     # fake must latch it from the bridge's button presses (Honda CruiseButtons values:
     # 1=MAIN, 2=CANCEL, 3=DECEL_SET, 4=RES_ACCEL) or openpilot waits forever.
     self.cruise_enabled = False
-    self._cruise_unengaged_frames = 0
-    self._cruise_drop_frames = 0
+    self.btn_set = 0
+    self.btn_res_cncl = 0
 
   # ------------------------------------------------------------------
   # Wire command -> PSCM plant
@@ -86,21 +86,14 @@ class FordSimulatedCar:
     # steady; this fake adds patient retry: if openpilot hasn't engaged ~1.5s after
     # cruise latched, drop cruise briefly and let the bridge's SET press produce a fresh
     # rising edge on a clean event board. Stops as soon as engagement sticks.
-    if self._cruise_drop_frames > 0:
-      self._cruise_drop_frames -= 1
-      self.cruise_enabled = False
-      return
     if ss.cruise_button in (3, 4):    # SET / RESUME
       self.cruise_enabled = True
     elif ss.cruise_button == 2 or ss.user_brake > 0:  # CANCEL or brake
       self.cruise_enabled = False
-    if ss.is_engaged:
-      self._cruise_unengaged_frames = 0
-    elif self.cruise_enabled:
-      self._cruise_unengaged_frames += 1
-      if self._cruise_unengaged_frames > 150:   # 1.5 s at 100 Hz
-        self._cruise_unengaged_frames = 0
-        self._cruise_drop_frames = 30           # 300 ms clean falling edge
+    # openpilot-longitudinal Fords engage on BUTTON EVENTS parsed off Steering_Data_FD1,
+    # not on cruise-state edges — pass the bridge's presses through as CAN signals.
+    self.btn_set = 1 if ss.cruise_button == 3 else 0
+    self.btn_res_cncl = 1 if ss.cruise_button in (2, 4) else 0
 
   def _update_plant(self, simulator_state: SimulatorState):
     raws = messaging.drain_sock_raw(self.can_sock)
@@ -162,7 +155,8 @@ class FordSimulatedCar:
     }))
     msg.append(self.packer.make_can_msg("Steering_Data_FD1", 0, {
       "TurnLghtSwtch_D_Stat": 1 if ss.left_blinker else (2 if ss.right_blinker else 0),
-      "CcAslButtnCnclPress": 0,
+      "CcAslButtnSetIncPress": self.btn_set,        # SET (engages openpilot-long cars)
+      "CcAslButtnCnclResPress": self.btn_res_cncl,  # RESUME / CANCEL
     }))
     msg.append(self.packer.make_can_msg("BodyInfo_3_FD1", 0, {}))  # all doors closed = 0
     msg.append(self.packer.make_can_msg("RCMStatusMessage2_FD1", 0, {
