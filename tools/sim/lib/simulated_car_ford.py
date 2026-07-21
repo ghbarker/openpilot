@@ -159,6 +159,7 @@ class FordSimulatedCar:
     msg.append(self.packer.make_can_msg("Gear_Shift_by_Wire_FD1", 0, {
       "TrnRng_D_RqGsm": 4,  # Drive
     }))
+    msg.append(self.packer.make_can_msg("PowertrainData_10", 0, {}))  # required for automatics
 
     # *** camera bus (2): stock IPMA chatter the cam parser expects ***
     # LateralMotionControl2 at its 8-byte DBC size is also the interface's "not a
