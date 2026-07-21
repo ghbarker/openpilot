@@ -9,7 +9,7 @@ Aux daemons with no bearing on the car (soundd, mapd, dm) are excluded — WSL a
 is not part of the car.
 
 Run fresh (GPU contexts fragment across rapid restarts — `wsl --shutdown` first):
-  FINGERPRINT=FORD_MUSTANG_MACH_E_MK1 GPU=1 BLOCK=dmonitoringmodeld,mapd,soundd \
+  FINGERPRINT=FORD_MUSTANG_MACH_E_MK1 GPU=1 BLOCK=dmonitoringmodeld,mapd,soundd,ui \
     pytest tools/sim/tests/test_ford_sim_drive.py -q -m slow
 """
 import os
@@ -30,7 +30,7 @@ CAR_PROCS = {"card", "controlsd", "selfdrived", "plannerd", "modeld", "locationd
 @pytest.mark.slow
 def test_mach_e_drives():
   os.environ.setdefault("FINGERPRINT", "FORD_MUSTANG_MACH_E_MK1")
-  os.environ.setdefault("BLOCK", "dmonitoringmodeld,mapd,soundd")
+  os.environ.setdefault("BLOCK", "dmonitoringmodeld,mapd,soundd,ui")
 
   from openpilot.tools.sim.bridge.metadrive.metadrive_bridge import MetaDriveBridge
 
