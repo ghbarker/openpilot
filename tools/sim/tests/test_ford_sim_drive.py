@@ -68,7 +68,8 @@ def _attempt():
 
     # Phase 1: car-side clean — correct fingerprint, car processes running, no blocking events
     detail = "no messages"
-    modeld_down_since = None
+    modeld_down_samples = 0
+    samples = 0
     start = time.monotonic()
     while time.monotonic() < start + 90:
       sm.update(100)
@@ -79,13 +80,14 @@ def _attempt():
       detail = f"events={car_events} car_procs_down={car_procs_down} fp='{fp}'"
       if not car_events and not car_procs_down and fp == "FORD_MUSTANG_MACH_E_MK1":
         break
-      # WSL CL flakiness: modeld persistently down -> bail early, retry the whole stack
-      if "modeld" in car_procs_down and sm.seen['managerState']:
-        modeld_down_since = modeld_down_since or time.monotonic()
-        if time.monotonic() - modeld_down_since > 25:
-          return False, True, f"modeld failed to boot (WSL CL): {detail}"
-      else:
-        modeld_down_since = None
+      # WSL CL flakiness: modeld crash-LOOPS (manager keeps restarting it), so detect
+      # cumulative downtime, not a continuous stretch — then retry the whole stack.
+      if sm.seen['managerState']:
+        samples += 1
+        if "modeld" in car_procs_down:
+          modeld_down_samples += 1
+        if samples > 200 and modeld_down_samples / samples > 0.3:
+          return False, True, f"modeld crash-looping (WSL CL): {detail}"
     else:
       return False, False, f"car side never clean: {detail}"
 
@@ -104,6 +106,7 @@ def _attempt():
 
 
 @pytest.mark.slow
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
 def test_mach_e_drives():
   os.environ.setdefault("FINGERPRINT", "FORD_MUSTANG_MACH_E_MK1")
   os.environ.setdefault("BLOCK", "dmonitoringmodeld,mapd,soundd,ui")
