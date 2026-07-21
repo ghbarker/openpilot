@@ -105,11 +105,13 @@ Ignition: {self.simulator_state.ignition} Engaged: {self.simulator_state.is_enga
     # BluePilot: pick the simulated car from the forced fingerprint — a FORD fingerprint
     # gets the Mach-E CAN-FD fake with the measured PSCM steering plant (closed over the
     # real LateralMotionControl2 wire command instead of generic actuators).
-    if os.environ.get("FINGERPRINT", "").startswith("FORD"):
+    sim_fp = os.environ.get("FINGERPRINT", "")
+    if sim_fp.startswith("FORD"):
       from openpilot.tools.sim.lib.simulated_car_ford import FordSimulatedCar
       self.simulated_car = FordSimulatedCar()
     else:
       self.simulated_car = SimulatedCar()
+    print(f"simulated car: {type(self.simulated_car).__name__} (FINGERPRINT={sim_fp!r})", flush=True)
     self.simulated_sensors = SimulatedSensors(self.dual_camera)
 
     self._exit_event = threading.Event()
