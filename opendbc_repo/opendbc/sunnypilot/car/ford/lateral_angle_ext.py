@@ -53,6 +53,25 @@ FORD_DBC_PATH_ANGLE_MAX = 0.5235
 # Auto-cal state persistence cadence: losing a save costs at most this much evidence.
 _AUTOCAL_SAVE_PERIOD_S = 30.0
 
+# --- Anti-weave smoothing (FordAngleSmoothing) -------------------------------------------
+# Spectral analysis of straight engaged driving (route 00000006, 9 windows) measured a
+# rhythmic 0.23 Hz steering dither plus a slow ±0.5 m sway, and 962 wire-LSB toggles/min.
+# Verified injectors: (a) the curvature_factor interp's 0.0003-wide transition band sits in
+# the straight-road noise range, so the weave modulates its own loop gain 1.0↔~1.2 — a
+# self-sustaining gain-scheduled limit cycle; (b) LatCtlPath_An_Actl's 0.0005 rad LSB
+# dithers at near-zero commands; (c) unfiltered per-frame model-prediction jitter at 50%
+# blend weight; (d) discontinuous exit-blend steps. Each gets a targeted, bounded remedy
+# below; with the toggle OFF the command path is bit-identical to the unsmoothed code.
+_SM_GAIN_RC_UP = 0.10     # s — gain-schedule input filter, rising |kappa| (preserves curve entry)
+_SM_GAIN_RC_DOWN = 0.60   # s — falling side (kills the 0.2-0.27 Hz gain modulation)
+_SM_PRED_RC = 0.12        # s — model predicted-curvature low-pass (inside VLT slack, t_base >= 0.20)
+_SM_ENTER_HYST = 0.0003   # 1/m — hysteresis on the curve-entering decision (above model noise)
+_SM_BLEND_SLEW = 0.0375   # blend-ratio slew per 20 Hz call = 0.75/s (full 0.50->0.125 in 0.5 s)
+_SM_OUT_TAU_BP = [0.0005, 0.0015]  # 1/m — output low-pass fades out by genuine-curve curvature
+_SM_OUT_TAU_V = [0.40, 0.0]        # s — strong only on straights; pass-through in curves
+_SM_WIRE_HOLD = 0.0003    # rad = 0.6 LSB — hold the wire value inside this band (no dither);
+                          # release step is 30x under the tightest soft ROC, panda-safe
+
 
 def _autocal_state_locked(state: str) -> bool:
   """True when the persisted state says the calibration is finished.
@@ -210,9 +229,23 @@ class LateralAngleExt:
     self._autocal_save_s = 0.0
     self._autocal_dirty = False
     self.bp_autocal_status = ""        # live ground-truth status, published in telemetry
+    # BluePilot: anti-weave smoothing (FordAngleSmoothing; see _SM_* constants).
+    self.smoothing_enabled = True      # matches the param default; re-read at 1 Hz
+    self._reset_smoothing_state()
     # Telemetry + autocal gate: the command this frame was modified by PSCM authority
     # limits or the DBC clamp — the car could not make the requested turn.
     self.bp_angle_saturated = False
+
+  def _reset_smoothing_state(self):
+    """Smoothing filters must not span disengagements/overrides — mirrored with the
+    path_angle_last = 0 resets in the three early-return paths."""
+    self._sm_kappa_sched = 0.0      # asym-filtered |kappa_cmd| (gain schedule + output tau)
+    self._sm_pred_filt = 0.0        # low-passed model predicted curvature
+    self._sm_pred_init = False
+    self._sm_b_blend = None         # slewed exit-blend ratio
+    self._sm_kappa_entering = False
+    self._sm_pa_out = 0.0           # output low-pass state
+    self._sm_pa_wire = 0.0          # held wire value
 
   def update_angle_params(self, params):
     """Sets per-platform gain defaults and reads user feel-factor params."""
@@ -247,6 +280,10 @@ class LateralAngleExt:
       self._autocal_param_ctr += 1
       if self._autocal_param_ctr >= 100:
         self._autocal_param_ctr = 0
+        try:
+          self.smoothing_enabled = bool(params.get_bool("FordAngleSmoothing"))
+        except Exception:
+          pass  # keep the previous value; default is enabled
         try:
           enabled = bool(params.get_bool("FordAngleAutoCal"))
           state = params.get("FordAngleAutoCalState", return_default=True) or ""
@@ -348,6 +385,7 @@ class LateralAngleExt:
       self.bp_angle_saturated = False
       if self.autocal is not None:  # steady-state timer and staged samples must not span disengagements
         self.autocal.idle()
+      self._reset_smoothing_state()
       return LateralResult(
         apply_curvature=0.0,
         curvature_rate=0.0,
@@ -394,6 +432,7 @@ class LateralAngleExt:
       self.bp_angle_saturated = False
       if self.autocal is not None:  # steady-state timer and staged samples must not span disengagements
         self.autocal.idle()
+      self._reset_smoothing_state()
       return LateralResult(
         apply_curvature=0.0,
         curvature_rate=0.0,
@@ -435,6 +474,7 @@ class LateralAngleExt:
       self.bp_kappa_cmd = self.get_current_curvature(CS)
       self._desired_curvature_last = float(actuators.curvature)
       self.precision_type = 1
+      self._reset_smoothing_state()  # path ramps back from zero; filters must too
       if self.stall_blip_frames_left <= 0:
         self.stall_blip_cooldown_s = _STALL_COOLDOWN_S
       return LateralResult(
@@ -467,7 +507,19 @@ class LateralAngleExt:
     if self.model is not None and len(self.model.orientationRate.z) >= 17:
       _curvatures_ref = np.array(self.model.orientationRate.z) / max(0.01, v_ego)
       _kappa_at_t_base = abs(float(interp(_t_base, ModelConstants.T_IDXS, _curvatures_ref)))
-    _kappa_entering = _kappa_at_t_base > abs(desired_curvature)
+    if self.smoothing_enabled:
+      # Anti-weave: hysteresis so noise straddling the entering/exiting boundary can't flip
+      # this boolean (and with it the exit-blend gate) frame to frame near zero curvature.
+      _d_enter = _kappa_at_t_base - abs(desired_curvature)
+      if _d_enter > _SM_ENTER_HYST:
+        _kappa_entering = True
+      elif _d_enter < -_SM_ENTER_HYST:
+        _kappa_entering = False
+      else:
+        _kappa_entering = self._sm_kappa_entering
+      self._sm_kappa_entering = _kappa_entering
+    else:
+      _kappa_entering = _kappa_at_t_base > abs(desired_curvature)
     if _kappa_entering:
       _kappa_factor = 1.0  # curve deepening ahead: full extra lookahead for gradual entry
     else:
@@ -481,6 +533,17 @@ class LateralAngleExt:
       predicted_curvature = float(
         interp(curvature_lookup_time, ModelConstants.T_IDXS, curvatures)
       )
+    if self.smoothing_enabled:
+      # Anti-weave: low-pass the model prediction (50% of the straight-road command) to strip
+      # frame-to-frame model jitter. Equivalent to a ~0.12 s earlier lookahead — inside the
+      # VLT's own slack (t_base >= 0.20 s), so no curve-entry cost.
+      _a_pred = _STEER_DT / (_SM_PRED_RC + _STEER_DT)
+      if not self._sm_pred_init:
+        self._sm_pred_filt = predicted_curvature
+        self._sm_pred_init = True
+      else:
+        self._sm_pred_filt += _a_pred * (predicted_curvature - self._sm_pred_filt)
+      predicted_curvature = float(self._sm_pred_filt)
 
     b = float(self.path_angle_blend_ratio)
     b = float(clip(b, 0.0, 1.0))
@@ -509,7 +572,17 @@ class LateralAngleExt:
     # Same bug class and fix as _PSCM_SAT_UNWIND_RATE and _soft_roc above.
     _desired_falling = abs(desired_curvature) < abs(self._desired_curvature_last) - 0.010
     _on_exit_near_limit = not _kappa_entering and (_pscm_lim >= 1 or _in_hard_sat or _desired_falling)
-    b_blend = float(clip(b * 0.25, 0.0, 1.0)) if _on_exit_near_limit else b
+    _b_target = float(clip(b * 0.25, 0.0, 1.0)) if _on_exit_near_limit else b
+    if self.smoothing_enabled:
+      # Anti-weave: slew instead of stepping the exit blend — boolean chatter then produces
+      # bounded 0.75/s ramps in the command mix rather than 4x discontinuities.
+      if self._sm_b_blend is None:
+        self._sm_b_blend = _b_target
+      else:
+        self._sm_b_blend += float(clip(_b_target - self._sm_b_blend, -_SM_BLEND_SLEW, _SM_BLEND_SLEW))
+      b_blend = float(self._sm_b_blend)
+    else:
+      b_blend = _b_target
     requested_curvature = predicted_curvature * b_blend + desired_curvature * (1.0 - b_blend)
     self._desired_curvature_last = desired_curvature
 
@@ -561,7 +634,21 @@ class LateralAngleExt:
     self.high_gain_calc = interp(v_ego, [13.5, 26.82], [(1.30 * self.low_speed_curv_factor), (self.path_angle_gain_highC_highV * self.high_speed_curv_factor)])
 
     # As the curve gets bigger, we will need a little boost to the signal to to not understeer
-    self.curvature_factor = interp(abs(kappa_cmd), [0.0007, 0.001], [self.low_gain_calc, self.high_gain_calc])
+    if self.smoothing_enabled:
+      # Anti-weave PRIMARY fix: this interp's 0.0003-wide transition band sits exactly in the
+      # straight-road noise range, so unfiltered |kappa_cmd| lets the weave modulate its own
+      # loop gain 1.0<->~1.2 every cycle — a self-sustaining limit cycle (measured 0.23 Hz on
+      # route 00000006). Asymmetric filter: fast rise (0.10 s) keeps curve-entry gain arrival
+      # within ~0.2 s; slow fall (0.60 s, f_c ~ 0.27 Hz) removes the modulation and ratchets
+      # toward the stable higher gain under oscillation instead of cycling.
+      _k_abs = abs(kappa_cmd)
+      _rc = _SM_GAIN_RC_UP if _k_abs > self._sm_kappa_sched else _SM_GAIN_RC_DOWN
+      _a_gain = _STEER_DT / (_rc + _STEER_DT)
+      self._sm_kappa_sched += _a_gain * (_k_abs - self._sm_kappa_sched)
+      _kappa_for_gain = self._sm_kappa_sched
+    else:
+      _kappa_for_gain = abs(kappa_cmd)
+    self.curvature_factor = interp(_kappa_for_gain, [0.0007, 0.001], [self.low_gain_calc, self.high_gain_calc])
 
     path_angle_calc = kappa_cmd * v_ego * self.curvature_factor
     path_angle = path_angle_calc
@@ -592,6 +679,25 @@ class LateralAngleExt:
     # active or the DBC clamp bit. Telemetry + a hard no-sample gate for the auto-calibration.
     self.bp_angle_saturated = bool(_in_hard_sat or _pscm_lim >= 1 or path_angle != _pre_dbc_clamp)
 
+    if self.smoothing_enabled:
+      # Anti-weave: curvature-scheduled output low-pass — strong on straights (rounds the
+      # residual 20 Hz steps from blend/model noise), fading to pass-through by genuine-curve
+      # curvature. Scheduled on the fast-RISING _sm_kappa_sched, so a real entry collapses the
+      # tau within ~0.2 s. A first-order filter's step is always <= the input step, so this can
+      # only relax the soft ROC clip below, never fight it.
+      # Schedule on the FASTER of the filtered and raw curvature: a genuine entry collapses
+      # the tau on its first frame (raw jumps past the band) while straight-road noise —
+      # whose raw excursions stay inside the band — still gets the full filtering.
+      _tau_out = float(interp(max(self._sm_kappa_sched, abs(kappa_cmd)), _SM_OUT_TAU_BP, _SM_OUT_TAU_V))
+      if _tau_out > 1e-6:
+        _a_out = _STEER_DT / (_tau_out + _STEER_DT)
+        self._sm_pa_out += _a_out * (path_angle - self._sm_pa_out)
+        path_angle = float(self._sm_pa_out)
+      else:
+        self._sm_pa_out = path_angle
+    else:
+      self._sm_pa_out = path_angle
+
     # Soft ROC limit — unconditional, slightly tighter than ford.h, applied before the
     # hardware bypass in ford.h is re-enabled.  Lets us observe whether the limit would
     # suppress control and tune it, while the PSCM still receives the clipped value.
@@ -608,6 +714,21 @@ class LateralAngleExt:
                             self.path_angle_last + _soft_roc))
     # BluePilot: did the soft ROC clip actually limit the path_angle we wanted to send this frame?
     self.bp_angle_rate_limited = bool(abs(path_angle - _path_angle_pre_roc) > 1e-9)
+
+    if self.smoothing_enabled:
+      # Anti-weave: half-LSB wire hold. LatCtlPath_An_Actl's LSB is 0.0005 rad; near-zero
+      # commands crossed a code boundary 962 times/min on the baseline route, and the PSCM
+      # integrates that square wave into the felt dither. Hold the wire value until the command
+      # moves a real step (0.6 LSB — asymmetric so the boundary itself can't chatter). Worst
+      # steady-state bias 0.3 mrad ~= kappa 1.4e-5 at 30 m/s, below the yaw-measurement quantum.
+      # A held frame is a zero-ROC frame; the release step is 30x under the tightest soft ROC —
+      # panda's path_angle checks cannot be tripped by this.
+      if abs(path_angle - self._sm_pa_wire) < _SM_WIRE_HOLD:
+        path_angle = self._sm_pa_wire
+      else:
+        self._sm_pa_wire = path_angle
+    else:
+      self._sm_pa_wire = path_angle
 
 
     # c0 always zero -- no centering trim in angle mode.
