@@ -28,6 +28,7 @@ from numpy import clip, interp
 from opendbc.car import DT_CTRL
 from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.ford.values import CarControllerParams
+from opendbc.sunnypilot.car.ford.angle_autocal import Frame
 from opendbc.sunnypilot.car.ford.angle_autocal_controller import AutoCalController
 from opendbc.sunnypilot.car.ford.lateral_curv_ext import LateralResult
 from opendbc.sunnypilot.car.ford.human_turn import HumanTurnDetector
@@ -719,14 +720,16 @@ class LateralAngleExt:
     # idling the pipeline). The controller owns the liveDelay warmup gate, nudge writes,
     # save cadence, and the lock -> disarm transition; a returned pair is adopted as the
     # live factors so this very frame steers with the new gain.
-    nudged = self.autocal_ctl.feed(v_ego, kappa_cmd, current_curvature,
-                                   CS.out.steeringPressed,
-                                   self.bp_angle_rate_limited, self.bp_curvature_deviation_limited,
-                                   self.bp_angle_saturated,
-                                   float(CS.out.steeringTorque), float(CS.out.aEgo),
-                                   max(ws_vals) - min(ws_vals),
-                                   self.low_speed_curv_factor, self.high_speed_curv_factor,
-                                   delay_estimated=str(self.sm['liveDelay'].status) == "estimated")
+    nudged = self.autocal_ctl.feed(
+      Frame(v_ego=v_ego, kappa_cmd=kappa_cmd, kappa_meas=current_curvature,
+            steering_pressed=bool(CS.out.steeringPressed),
+            angle_rate_limited=self.bp_angle_rate_limited,
+            deviation_limited=self.bp_curvature_deviation_limited,
+            saturated=self.bp_angle_saturated,
+            driver_torque=float(CS.out.steeringTorque), a_ego=float(CS.out.aEgo),
+            ws_spread=max(ws_vals) - min(ws_vals),
+            low_factor=self.low_speed_curv_factor, high_factor=self.high_speed_curv_factor),
+      delay_estimated=str(self.sm['liveDelay'].status) == "estimated")
     if nudged is not None:
       self.low_speed_curv_factor = float(nudged[0])
       self.high_speed_curv_factor = float(nudged[1])
