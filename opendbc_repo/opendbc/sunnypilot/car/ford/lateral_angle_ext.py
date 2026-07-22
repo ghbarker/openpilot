@@ -71,6 +71,12 @@ _SM_OUT_TAU_BP = [0.0005, 0.0015]  # 1/m — output low-pass fades out by genuin
 _SM_OUT_TAU_V = [0.40, 0.0]        # s — strong only on straights; pass-through in curves
 _SM_WIRE_HOLD = 0.0003    # rad = 0.6 LSB — hold the wire value inside this band (no dither);
                           # release step is 30x under the tightest soft ROC, panda-safe
+# Manual strength (FordAngleSmoothStrength, 0.0..1.5 in the menu): scales the STRAIGHT-ROAD
+# filtering only — the falling gain-filter tau, the prediction tau, the output tau ceiling
+# and the wire-hold band. The curve-entry guarantees are strength-independent by design:
+# the rise tau, the entering hysteresis, the blend slew and the raw-kappa tau collapse
+# (max(sched, raw)) are fixed, so even 1.5 cannot soften a genuine entry.
+_SM_STRENGTH_MAX = 1.5
 
 
 def _autocal_state_locked(state: str) -> bool:
@@ -231,6 +237,7 @@ class LateralAngleExt:
     self.bp_autocal_status = ""        # live ground-truth status, published in telemetry
     # BluePilot: anti-weave smoothing (FordAngleSmoothing; see _SM_* constants).
     self.smoothing_enabled = True      # matches the param default; re-read at 1 Hz
+    self.smoothing_strength = 1.0      # FordAngleSmoothStrength (0..1.5); scales straight-road filtering
     self._reset_smoothing_state()
     # Telemetry + autocal gate: the command this frame was modified by PSCM authority
     # limits or the DBC clamp — the car could not make the requested turn.
@@ -282,8 +289,13 @@ class LateralAngleExt:
         self._autocal_param_ctr = 0
         try:
           self.smoothing_enabled = bool(params.get_bool("FordAngleSmoothing"))
+          raw_strength = params.get("FordAngleSmoothStrength", return_default=True)
+          if raw_strength is not None and raw_strength != b"":
+            self.smoothing_strength = float(clip(float(
+              raw_strength.decode("utf-8", errors="replace") if isinstance(raw_strength, bytes) else raw_strength),
+              0.0, _SM_STRENGTH_MAX))
         except Exception:
-          pass  # keep the previous value; default is enabled
+          pass  # keep the previous values; defaults are enabled / 1.0
         try:
           enabled = bool(params.get_bool("FordAngleAutoCal"))
           state = params.get("FordAngleAutoCalState", return_default=True) or ""
@@ -537,7 +549,8 @@ class LateralAngleExt:
       # Anti-weave: low-pass the model prediction (50% of the straight-road command) to strip
       # frame-to-frame model jitter. Equivalent to a ~0.12 s earlier lookahead — inside the
       # VLT's own slack (t_base >= 0.20 s), so no curve-entry cost.
-      _a_pred = _STEER_DT / (_SM_PRED_RC + _STEER_DT)
+      _pred_rc = _SM_PRED_RC * self.smoothing_strength
+      _a_pred = _STEER_DT / (_pred_rc + _STEER_DT) if _pred_rc > 1e-6 else 1.0
       if not self._sm_pred_init:
         self._sm_pred_filt = predicted_curvature
         self._sm_pred_init = True
@@ -642,7 +655,8 @@ class LateralAngleExt:
       # within ~0.2 s; slow fall (0.60 s, f_c ~ 0.27 Hz) removes the modulation and ratchets
       # toward the stable higher gain under oscillation instead of cycling.
       _k_abs = abs(kappa_cmd)
-      _rc = _SM_GAIN_RC_UP if _k_abs > self._sm_kappa_sched else _SM_GAIN_RC_DOWN
+      _rc_down = max(_SM_GAIN_RC_UP, _SM_GAIN_RC_DOWN * self.smoothing_strength)
+      _rc = _SM_GAIN_RC_UP if _k_abs > self._sm_kappa_sched else _rc_down
       _a_gain = _STEER_DT / (_rc + _STEER_DT)
       self._sm_kappa_sched += _a_gain * (_k_abs - self._sm_kappa_sched)
       _kappa_for_gain = self._sm_kappa_sched
@@ -689,6 +703,7 @@ class LateralAngleExt:
       # the tau on its first frame (raw jumps past the band) while straight-road noise —
       # whose raw excursions stay inside the band — still gets the full filtering.
       _tau_out = float(interp(max(self._sm_kappa_sched, abs(kappa_cmd)), _SM_OUT_TAU_BP, _SM_OUT_TAU_V))
+      _tau_out *= self.smoothing_strength
       if _tau_out > 1e-6:
         _a_out = _STEER_DT / (_tau_out + _STEER_DT)
         self._sm_pa_out += _a_out * (path_angle - self._sm_pa_out)
@@ -723,7 +738,7 @@ class LateralAngleExt:
       # steady-state bias 0.3 mrad ~= kappa 1.4e-5 at 30 m/s, below the yaw-measurement quantum.
       # A held frame is a zero-ROC frame; the release step is 30x under the tightest soft ROC —
       # panda's path_angle checks cannot be tripped by this.
-      if abs(path_angle - self._sm_pa_wire) < _SM_WIRE_HOLD:
+      if abs(path_angle - self._sm_pa_wire) < _SM_WIRE_HOLD * self.smoothing_strength:
         path_angle = self._sm_pa_wire
       else:
         self._sm_pa_wire = path_angle

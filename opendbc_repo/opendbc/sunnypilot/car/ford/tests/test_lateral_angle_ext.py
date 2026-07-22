@@ -357,6 +357,37 @@ class TestAngleSmoothing(unittest.TestCase):
     self.assertEqual(ext._sm_pa_wire, 0.0)
     self.assertIsNone(ext._sm_b_blend)
 
+  def test_strength_zero_disables_wire_hold(self):
+    ext = self._ext(True)
+    ext.smoothing_strength = 0.0
+    self._drive(ext, [0.0015] * 60)
+    outs = self._drive(ext, [0.0015 + (2e-6 if i % 2 else -2e-6) for i in range(30)])
+    # With no hold band, even tiny dither reaches the wire (output varies frame to frame).
+    self.assertGreater(len({round(o, 9) for o in outs[5:]}), 1)
+
+  def test_strength_max_entry_still_fast(self):
+    ramp = [min(0.003, 0.0002 * i) for i in range(60)]
+    off = self._drive(self._ext(False), ramp)
+    strong = self._ext(True)
+    strong.smoothing_strength = 1.5
+    on = self._drive(strong, ramp)
+    target = 0.9 * off[-1]
+    t_off = next(i for i, x in enumerate(off) if x >= target)
+    t_on = next(i for i, x in enumerate(on) if x >= target)
+    self.assertLessEqual(t_on - t_off, 2)  # entry guarantee is strength-independent
+
+  def test_param_glue_reads_strength(self):
+    ext = self._ext(True)
+    p = _SmParams({"FordAngleSmoothing": True, "FordAngleSmoothStrength": 0.5,
+                   "FordAngleAutoCal": 0, "FordAngleAutoCalState": ""})
+    for _ in range(101):
+      ext.update_angle_params(p)
+    self.assertAlmostEqual(ext.smoothing_strength, 0.5)
+    p.values["FordAngleSmoothStrength"] = 9.0  # clamped to the menu max
+    for _ in range(101):
+      ext.update_angle_params(p)
+    self.assertAlmostEqual(ext.smoothing_strength, 1.5)
+
   def test_param_glue_reads_toggle(self):
     ext = self._ext(True)
     p = _SmParams({"FordAngleSmoothing": False, "FordAngleAutoCal": 0, "FordAngleAutoCalState": ""})
