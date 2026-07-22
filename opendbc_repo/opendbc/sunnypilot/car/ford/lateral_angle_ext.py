@@ -62,15 +62,19 @@ _AUTOCAL_SAVE_PERIOD_S = 30.0
 # dithers at near-zero commands; (c) unfiltered per-frame model-prediction jitter at 50%
 # blend weight; (d) discontinuous exit-blend steps. Each gets a targeted, bounded remedy
 # below; with the toggle OFF the command path is bit-identical to the unsmoothed code.
+# (A curvature-scheduled OUTPUT low-pass was part of the original package and was REMOVED:
+# the closed-loop rig (bp-tools/sim/closed_loop_weave.py) measured it degrading straight
+# station-keeping ~2.5x — pure in-loop lag — while the wire hold alone matched stock
+# station-keeping exactly AND delivers the -55..70% dither kill. Don't re-add output lag.)
 _SM_GAIN_RC_UP = 0.10     # s — gain-schedule input filter, rising |kappa| (preserves curve entry)
 _SM_GAIN_RC_DOWN = 0.60   # s — falling side (kills the 0.2-0.27 Hz gain modulation)
 _SM_PRED_RC = 0.12        # s — model predicted-curvature low-pass (inside VLT slack, t_base >= 0.20)
 _SM_ENTER_HYST = 0.0003   # 1/m — hysteresis on the curve-entering decision (above model noise)
 _SM_BLEND_SLEW = 0.0375   # blend-ratio slew per 20 Hz call = 0.75/s (full 0.50->0.125 in 0.5 s)
-_SM_OUT_TAU_BP = [0.0005, 0.0015]  # 1/m — output low-pass fades out by genuine-curve curvature
-_SM_OUT_TAU_V = [0.40, 0.0]        # s — strong only on straights; pass-through in curves
-_SM_WIRE_HOLD = 0.0003    # rad = 0.6 LSB — hold the wire value inside this band (no dither);
-                          # release step is 30x under the tightest soft ROC, panda-safe
+_SM_WIRE_HOLD = 0.0005    # rad = 1 LSB — hold the wire value inside this band (no dither).
+                          # Closed-loop rig: station-keeping 0.042 m vs 0.039 stock at this
+                          # width (negligible); replay: -44% LSB crossings. Release step even
+                          # at max strength (0.00075) is 12x under the tightest soft ROC.
 # Manual strength (FordAngleSmoothStrength, menu 1.0..2.5, factor-style semantics):
 #   1.0  = stock steering, NO smoothing at all (bit-identical to the toggle being off)
 #   >1.0 = increasing damping; 2.0 = the log-tuned package, 2.5 = strongest
@@ -259,7 +263,6 @@ class LateralAngleExt:
     self._sm_pred_init = False
     self._sm_b_blend = None         # slewed exit-blend ratio
     self._sm_kappa_entering = False
-    self._sm_pa_out = 0.0           # output low-pass state
     self._sm_pa_wire = 0.0          # held wire value
 
   def update_angle_params(self, params):
@@ -701,26 +704,6 @@ class LateralAngleExt:
     # BluePilot: the car cannot make the requested turn this frame — PSCM authority limit
     # active or the DBC clamp bit. Telemetry + a hard no-sample gate for the auto-calibration.
     self.bp_angle_saturated = bool(_in_hard_sat or _pscm_lim >= 1 or path_angle != _pre_dbc_clamp)
-
-    if self._sm_on():
-      # Anti-weave: curvature-scheduled output low-pass — strong on straights (rounds the
-      # residual 20 Hz steps from blend/model noise), fading to pass-through by genuine-curve
-      # curvature. Scheduled on the fast-RISING _sm_kappa_sched, so a real entry collapses the
-      # tau within ~0.2 s. A first-order filter's step is always <= the input step, so this can
-      # only relax the soft ROC clip below, never fight it.
-      # Schedule on the FASTER of the filtered and raw curvature: a genuine entry collapses
-      # the tau on its first frame (raw jumps past the band) while straight-road noise —
-      # whose raw excursions stay inside the band — still gets the full filtering.
-      _tau_out = float(interp(max(self._sm_kappa_sched, abs(kappa_cmd)), _SM_OUT_TAU_BP, _SM_OUT_TAU_V))
-      _tau_out *= self.smoothing_strength
-      if _tau_out > 1e-6:
-        _a_out = _STEER_DT / (_tau_out + _STEER_DT)
-        self._sm_pa_out += _a_out * (path_angle - self._sm_pa_out)
-        path_angle = float(self._sm_pa_out)
-      else:
-        self._sm_pa_out = path_angle
-    else:
-      self._sm_pa_out = path_angle
 
     # Soft ROC limit — unconditional, slightly tighter than ford.h, applied before the
     # hardware bypass in ford.h is re-enabled.  Lets us observe whether the limit would
