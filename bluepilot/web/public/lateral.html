@@ -73,7 +73,7 @@ function connect() {
   es.onmessage = (ev) => {
     const d = JSON.parse(ev.data);
     lastFrameWall = performance.now();
-    if (!paused) {
+    if (!paused && Math.abs(d.desired_deg) < 600 && Math.abs(d.actual_deg) < 600) {
       buf.push({ t: d.t, des: d.desired_deg, act: d.actual_deg });
       const cut = d.t - WINDOW_S;
       while (buf.length && buf[0].t < cut) buf.shift();
@@ -122,7 +122,9 @@ function draw() {
   // grid + labels
   ctx.strokeStyle = '#1d222b'; ctx.fillStyle = '#666c78';
   ctx.font = '11px sans-serif'; ctx.textAlign = 'right'; ctx.lineWidth = 1;
-  const step = m > 40 ? 20 : m > 16 ? 10 : m > 8 ? 5 : 2;
+  const rawStep = (2 * m) / 8;
+  const pow10 = Math.pow(10, Math.floor(Math.log10(rawStep)));
+  const step = [1, 2, 5, 10].map(k => k * pow10).find(s => s >= rawStep) || 10 * pow10;
   for (let v = -Math.floor(m / step) * step; v <= m; v += step) {
     ctx.beginPath(); ctx.moveTo(padL, y(v)); ctx.lineTo(w - padR, y(v)); ctx.stroke();
     ctx.fillText(v + '°', padL - 5, y(v) + 4);
