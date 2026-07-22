@@ -269,8 +269,8 @@ class TestAngleSmoothing(unittest.TestCase):
                                  [ext.low_gain_calc, ext.high_gain_calc]))
       self.assertAlmostEqual(ext.curvature_factor, expected, places=12)
     # OFF path must leave the smoothing filters untouched at their reset values.
-    self.assertEqual(ext._sm_kappa_sched, 0.0)
-    self.assertIsNone(ext._sm_b_blend)
+    self.assertEqual(ext.smoother._sched, 0.0)
+    self.assertIsNone(ext.smoother._b_blend)
 
   def test_on_gain_schedule_filters_oscillation(self):
     ext = self._ext(True)
@@ -284,17 +284,17 @@ class TestAngleSmoothing(unittest.TestCase):
     self.assertLess(max(tail) - min(tail), 0.05)
 
   def test_gain_filter_asymmetry(self):
-    from opendbc.sunnypilot.car.ford.lateral_angle_ext import _SM_GAIN_RC_UP, _SM_GAIN_RC_DOWN
+    from opendbc.sunnypilot.car.ford.angle_smoothing import GAIN_RC_UP as _SM_GAIN_RC_UP, GAIN_RC_DOWN as _SM_GAIN_RC_DOWN
     ext = self._ext(True)
     rise_frames = int(2.3 * _SM_GAIN_RC_UP / 0.05) + 2
     self._drive(ext, [0.002] * rise_frames, model_kappa=0.002)
-    self.assertGreater(ext._sm_kappa_sched, 0.9 * 0.002)
+    self.assertGreater(ext.smoother._sched, 0.9 * 0.002)
     fall_frames = int(_SM_GAIN_RC_DOWN / 0.05)
     self._drive(ext, [0.0] * fall_frames, model_kappa=0.0)
-    self.assertGreater(ext._sm_kappa_sched, 0.3 * 0.002)
+    self.assertGreater(ext.smoother._sched, 0.3 * 0.002)
 
   def test_wire_hold_stops_sub_lsb_dither(self):
-    from opendbc.sunnypilot.car.ford.lateral_angle_ext import _SM_WIRE_HOLD
+    from opendbc.sunnypilot.car.ford.angle_smoothing import WIRE_HOLD as _SM_WIRE_HOLD
     ext = self._ext(True)
     self._drive(ext, [0.0015] * 60)  # settle onto a working point
     held = ext.path_angle_last
@@ -305,15 +305,15 @@ class TestAngleSmoothing(unittest.TestCase):
     self.assertNotAlmostEqual(out[-1], held, places=6)
 
   def test_blend_slew_bounded(self):
-    from opendbc.sunnypilot.car.ford.lateral_angle_ext import _SM_BLEND_SLEW
+    from opendbc.sunnypilot.car.ford.angle_smoothing import BLEND_SLEW as _SM_BLEND_SLEW
     ext = self._ext(True)
     ext.model = _SmModel(0.002, self.V)
     prev = None
     for d in [0.002] * 20 + [0.015, 0.002] * 20:  # >0.010 drops toggle _desired_falling
       ext.update_angle_strategy(_CC(), self._cs(d), _Actuators(curvature=d), _explorer_cp())
-      if prev is not None and ext._sm_b_blend is not None:
-        self.assertLessEqual(abs(ext._sm_b_blend - prev), _SM_BLEND_SLEW + 1e-9)
-      prev = ext._sm_b_blend
+      if prev is not None and ext.smoother._b_blend is not None:
+        self.assertLessEqual(abs(ext.smoother._b_blend - prev), _SM_BLEND_SLEW + 1e-9)
+      prev = ext.smoother._b_blend
 
   def test_kappa_entering_hysteresis(self):
     ext = self._ext(True)
@@ -323,9 +323,9 @@ class TestAngleSmoothing(unittest.TestCase):
       mk = 0.0005 + (0.0001 if i % 2 else -0.0001)  # dither inside the +-0.0003 band
       ext.model = _SmModel(mk, self.V)
       ext.update_angle_strategy(_CC(), self._cs(0.0005), _Actuators(curvature=0.0005), _explorer_cp())
-      if last is not None and ext._sm_kappa_entering != last:
+      if last is not None and ext.smoother._entering != last:
         flips += 1
-      last = ext._sm_kappa_entering
+      last = ext.smoother._entering
     self.assertEqual(flips, 0)
 
   def test_curve_entry_not_softened(self):
@@ -352,12 +352,12 @@ class TestAngleSmoothing(unittest.TestCase):
   def test_resets_on_override_paths(self):
     ext = self._ext(True)
     self._drive(ext, [0.002] * 40)
-    self.assertGreater(ext._sm_kappa_sched, 0.0)
+    self.assertGreater(ext.smoother._sched, 0.0)
     ext.human_turn_detector = _ForcedDetector(True)  # forces the override early-return
     ext.update_angle_strategy(_CC(), self._cs(0.002), _Actuators(curvature=0.002), _explorer_cp())
-    self.assertEqual(ext._sm_kappa_sched, 0.0)
-    self.assertEqual(ext._sm_pa_wire, 0.0)
-    self.assertIsNone(ext._sm_b_blend)
+    self.assertEqual(ext.smoother._sched, 0.0)
+    self.assertEqual(ext.smoother._wire, 0.0)
+    self.assertIsNone(ext.smoother._b_blend)
 
   def test_menu_one_is_bit_identical_stock(self):
     # Menu 1.0 (effective 0) must equal the toggle-off path EXACTLY, frame by frame.
