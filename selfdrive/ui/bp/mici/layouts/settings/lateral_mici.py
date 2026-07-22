@@ -33,7 +33,7 @@ class LateralLayoutMici(NavScroller):
       "Smooth Steering (Anti-Weave)", "FordAngleSmoothing",
     )
     self.angle_smoothing_strength = BigParamFloatControl(
-      "Smoothing Strength", "FordAngleSmoothStrength", min=0.0, max=1.5, step=0.1,
+      "Smoothing Strength", "FordAngleSmoothStrength", min=1.0, max=2.5, step=0.1,
     )
     self.lane_change_factor_high_ang = BigParamFloatControl(
       "Lane Change Factor High", "lane_change_factor_high_ang", min=0.85, max=1.50,

@@ -244,6 +244,8 @@ class TestAngleSmoothing(unittest.TestCase):
     ext.CP = cp  # update_angle_params reads self.CP (set by carcontroller in the real stack)
     ext.human_turn_detector = _ForcedDetector(False)
     ext.smoothing_enabled = smoothing
+    # Effective scale (menu - 1.0): tests exercise the tuned package (menu 2.0).
+    ext.smoothing_strength = 1.0 if smoothing else 0.0
     return ext
 
   def _cs(self, desired=0.0):
@@ -357,13 +359,16 @@ class TestAngleSmoothing(unittest.TestCase):
     self.assertEqual(ext._sm_pa_wire, 0.0)
     self.assertIsNone(ext._sm_b_blend)
 
-  def test_strength_zero_disables_wire_hold(self):
-    ext = self._ext(True)
-    ext.smoothing_strength = 0.0
-    self._drive(ext, [0.0015] * 60)
-    outs = self._drive(ext, [0.0015 + (2e-6 if i % 2 else -2e-6) for i in range(30)])
-    # With no hold band, even tiny dither reaches the wire (output varies frame to frame).
-    self.assertGreater(len({round(o, 9) for o in outs[5:]}), 1)
+  def test_menu_one_is_bit_identical_stock(self):
+    # Menu 1.0 (effective 0) must equal the toggle-off path EXACTLY, frame by frame.
+    import random
+    rng = random.Random(7)
+    seq = [rng.uniform(-0.003, 0.003) for _ in range(200)]
+    off = self._drive(self._ext(False), seq)
+    neutral = self._ext(True)
+    neutral.smoothing_strength = 0.0  # menu 1.0
+    on = self._drive(neutral, seq)
+    self.assertEqual(off, on)
 
   def test_strength_max_entry_still_fast(self):
     ramp = [min(0.003, 0.0002 * i) for i in range(60)]
@@ -378,15 +383,19 @@ class TestAngleSmoothing(unittest.TestCase):
 
   def test_param_glue_reads_strength(self):
     ext = self._ext(True)
-    p = _SmParams({"FordAngleSmoothing": True, "FordAngleSmoothStrength": 0.5,
+    p = _SmParams({"FordAngleSmoothing": True, "FordAngleSmoothStrength": 1.5,
                    "FordAngleAutoCal": 0, "FordAngleAutoCalState": ""})
     for _ in range(101):
       ext.update_angle_params(p)
-    self.assertAlmostEqual(ext.smoothing_strength, 0.5)
-    p.values["FordAngleSmoothStrength"] = 9.0  # clamped to the menu max
+    self.assertAlmostEqual(ext.smoothing_strength, 0.5)  # menu 1.5 -> effective 0.5
+    p.values["FordAngleSmoothStrength"] = 9.0  # clamped to the menu max (2.5)
     for _ in range(101):
       ext.update_angle_params(p)
     self.assertAlmostEqual(ext.smoothing_strength, 1.5)
+    p.values["FordAngleSmoothStrength"] = 0.2  # below stock clamps to menu 1.0 = neutral
+    for _ in range(101):
+      ext.update_angle_params(p)
+    self.assertAlmostEqual(ext.smoothing_strength, 0.0)
 
   def test_param_glue_reads_toggle(self):
     ext = self._ext(True)

@@ -551,12 +551,12 @@ class BluePilotLayout(Widget):
     # Manual strength for the smoothing above: 0 = minimal, 1.0 = tuned default, 1.5 = strong.
     self._angle_smoothing_strength = float_control_item(
       lambda: tr("Smoothing Strength"),
-      lambda: tr("How aggressively the anti-weave filtering acts on straight roads. "
-                 "0 = minimal, 1.0 = tuned default, 1.5 = strong. Curve response is "
-                 "unaffected at any strength."),
+      lambda: tr("1.0 = stock steering (no smoothing). Step up for more damping of the "
+                 "straight-road weave; 2.0 = the log-tuned setting, 2.5 = strongest. "
+                 "Curve response is unaffected at any strength."),
       param="FordAngleSmoothStrength",
-      min_value=0.0,
-      max_value=1.5,
+      min_value=1.0,
+      max_value=2.5,
       step=0.1,
       icon="chffr_wheel.png"
     )
