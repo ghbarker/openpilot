@@ -48,8 +48,10 @@ calibrator uses the same values the +/- buttons use, so the menu is always the t
 
 What it's doing underneath:
 
-- Evidence comes from **steady engaged curves** and from **curve apexes** (the "tops and
-  bottoms of the graphs"), so winding roads count even when nothing is steady.
+- Evidence comes from engaged curves — including **winding roads where the wheel never
+  stops moving**: the comparison is made against the command from the car's own measured
+  steering delay ago, so a continuously changing curve reads correctly instead of being
+  discarded. Curve **apexes** (the "tops and bottoms of the graphs") count separately.
 - Everything suspicious is thrown away: potholes and bump-flicks, rough washboard
   surfaces, hard braking/accelerating, tire-limit cornering, any moment your hands are on
   the wheel (plus a cooldown after), and crowned/banked roads that push all the evidence
