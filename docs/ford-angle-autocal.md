@@ -54,8 +54,28 @@ What it's doing underneath:
   surfaces, hard braking/accelerating, tire-limit cornering, any moment your hands are on
   the wheel (plus a cooldown after), and crowned/banked roads that push all the evidence
   to one side.
+- **Every adjustment is checked before the next one.** After a step, the calibrator
+  collects a fresh batch of clean curves *at the new value* and confirms the car's
+  response actually moved the way the step predicted. Confirmed → it keeps going.
+  Contradicted → it stops moving that factor and demands twice the evidence before
+  trying again. Poll a couple turns, adjust, poll some more — enforced, not hoped.
 - Evidence **survives ignition cycles** — progress is saved every 30 seconds and picked
   up on the next drive.
+
+## Watching it live from your phone
+
+The [phone graph page](lateral-phone-graph.md) (`http://192.168.43.1:8088/lateral` on the
+device hotspot) shows a **calibration dashboard** whenever the calibrator is armed: one
+card per speed band (low, under 30 mph / high, over 60 mph) with
+
+- how much clean-curve evidence each band has collected (and how much it needs),
+- what the car is measured doing right now — e.g. **"turns 93% of requested"**,
+- the current factor and the step it wants to try next — **"factor 1.00 → try 1.08"**,
+- live *checking…* progress while a fresh step is being verified, and whether the last
+  step **confirmed ✓** or didn't.
+
+A pill in the corner shows which band your current speed is feeding ("42 mph · blend
+zone"). Between 30 and 60 mph evidence splits between both anchors.
 
 ## How long does it take?
 
@@ -88,14 +108,29 @@ When both factors have solid evidence behind them and the applied values have sa
 - The toggle stays on but does nothing further.
 
 **To recalibrate** (new tires, alignment work, seasonal tire swap, or you just want a
-fresh pass): toggle it **off and back on**. That clears everything and starts a clean
-collection.
+fresh pass): toggle it **off and back on**. That clears the evidence and starts a clean
+collection *from the current factor values*.
+
+## Erase Calibration Memory
+
+Next to the toggle sits **Erase Calibration Memory** — the full do-over. One tap:
+
+- wipes all collected evidence and any lock,
+- clears the calibrator's error log,
+- and puts **both factors back to 1.00** (stock).
+
+Use it when a calibration run went somewhere you don't trust and you want to retry from
+a clean slate rather than from wherever the factors ended up. It works offroad or
+mid-drive (takes effect within a second while driving), and the phone dashboard shows
+"memory erased" when it lands.
 
 ## What it will never do
 
-- It never moves a factor more than **0.02 per step**, **0.10 per drive** for the high
-  factor and **0.04 per drive** for the low factor — one drive can't transform how your
-  car steers.
+- It never moves a factor more than **0.02 per step**, and never steps the same factor
+  again until fresh driving data at the new value has confirmed the previous step.
+  There is deliberately **no cap on total movement** — a car that is genuinely far off
+  is allowed to walk all the way to its fit — because every step of that walk has to
+  keep verifying against the road.
 - It never acts on thin data: each factor needs sustained clean evidence and a tight
   error bar before its first nudge.
 - It never runs in curvature mode, never runs while locked, and never runs before the
@@ -110,6 +145,8 @@ collection.
 | Factors moved, then stopped | It probably **locked** — that's success. Toggle off/on if you want a re-run. |
 | Low factor barely changes while high converged | Expected — see "How long does it take?". Gentle mid-speed curves with hands off are the low anchor's food. |
 | A value looks wrong after calibration | Tap +/- to your preferred value; the calibrator adopts it. If it drifts back, the data disagrees with you — try a re-run after checking tire pressures/alignment. |
+| Whole run went somewhere you don't trust | **Erase Calibration Memory** — factors back to 1.00, evidence wiped, clean retry. |
+| Steps keep showing "didn't verify" on the phone dashboard | The car's measured response is contradicting the model — usually bad data conditions (crosswind, rough roads, constant light grip). The calibrator is protecting you by refusing to walk further; give it cleaner roads. |
 | Suspected fault | The calibrator writes any internal error to the `FordAngleAutoCalError` param (visible in logs) instead of failing silently — include it when reporting. |
 
 ## For the curious

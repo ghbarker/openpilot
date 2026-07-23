@@ -149,14 +149,21 @@ NUDGE_MIN_WEIGHT = 10.0     # anchor evidence before it may move its factor
 NUDGE_MAX_STDERR = 0.06     # effective stderr must be at least this good
 NUDGE_DEADBAND = 0.015      # |target - applied| below this: leave it alone
 NUDGE_STEP = 0.02           # max factor change per nudge (menu granularity is 0.01)
-MAX_DRIVE_DELTA = 0.10      # high-factor cumulative cap per drive (card process lifetime)
-# The low anchor accumulates evidence far slower than the high one (city curve frames are
-# mostly grip/accel-rejected), so each sample moves it more. On-road 2026-07-22 the low
-# factor round-tripped 0.98->1.06->1.00 inside one drive on ~70s of evidence and the
-# +-6% curve-branch gain swing (x1.30 branch) was felt as turn-in overshoot. Half the cap
-# bounds any single drive's wander to two steps while still allowing full convergence
-# (0.96->1.00 fit within it).
-MAX_DRIVE_DELTA_LOW = 0.04  # low-factor cumulative cap per drive
+
+# --- Adjust-then-verify ------------------------------------------------------------------
+# 2026-07-22 design decision: the per-drive movement caps (0.10 high / 0.04 low) are GONE —
+# a genuinely miscalibrated car must be allowed to walk all the way to its fit in one
+# drive. What replaces them is an explicit check instead of a leash: every step is judged
+# against FRESH post-step evidence before its anchor may step again. The response ratio
+# (measured/commanded curvature) scales with the applied gain, so a step from g_old to
+# g_new predicts the direction the ratio must move; a fast-forgetting per-anchor ratio
+# tracker measures whether it actually did. Confirmed -> keep walking. Failed -> the data
+# contradicted the model: hold that anchor until twice the normal evidence has spoken.
+# This is the "poll a couple turns, adjust, poll some more" loop, made enforceable.
+VERIFY_MIN_WEIGHT = 6.0        # fresh post-step evidence (s) before the step is judged
+VERIFY_FAIL_HOLD_WEIGHT = 12.0 # a failed check demands this much evidence before stepping again
+VERIFY_OK_BAND = 0.04          # |1 - ratio| inside this after a step = success outright
+TAU_RECENT_S = 90.0            # recent-response forgetting (seconds of active collection)
 
 # --- Lock --------------------------------------------------------------------------------
 # LOCK_MIN_WEIGHT sits below the reference drive's decay equilibrium (~90 s on the weaker
@@ -207,6 +214,10 @@ class AngleFactorEstimator:
     # Left/right split per anchor half for bank-bias detection: {(half, dir): [w, wy]}
     # half: 0 = alpha < 0.5 (low anchor side), 1 = high side; dir: 0 = left, 1 = right.
     self.lr = {(h, d): [0.0, 0.0] for h in (0, 1) for d in (0, 1)}
+    # Fast-forgetting per-anchor response ratio r = meas/cmd (TAU_RECENT_S): "what is the
+    # car doing RIGHT NOW under the current factors" — the adjust-then-verify check and
+    # the live dashboard read this, the long-memory fit above never does.
+    self.recent = {0: [0.0, 0.0], 1: [0.0, 0.0]}  # half -> [w, sum w*r]
 
   def add_sample(self, v_ego: float, kappa_cmd: float, kappa_meas: float,
                  applied_gain: float, weight: float = 1.0) -> bool:
@@ -237,16 +248,26 @@ class AngleFactorEstimator:
     self.s_w += w
     self.s_wy2 += w * y * y
     self.n += 1
-    acc = self.lr[(0 if a < 0.5 else 1, 0 if kappa_cmd > 0 else 1)]
+    half = 0 if a < 0.5 else 1
+    acc = self.lr[(half, 0 if kappa_cmd > 0 else 1)]
     acc[0] += w
     acc[1] += w * y
+    rec = self.recent[half]
+    rec[0] += w
+    rec[1] += w * r
     return True
 
   def decay(self, seconds: float):
     """Exponential evidence forgetting: old drives fade so adaptation stays possible,
-    while the ~TAU saturation keeps lock thresholds reachable and stable."""
+    while the ~TAU saturation keeps lock thresholds reachable and stable. The recent
+    tracker forgets much faster (TAU_RECENT_S) — it must answer for the car as it is
+    now, not as it averaged over hours."""
     f = math.exp(-float(seconds) / TAU_EVIDENCE_S)
     self.scale(f)
+    fr = math.exp(-float(seconds) / TAU_RECENT_S)
+    for rec in self.recent.values():
+      rec[0] *= fr
+      rec[1] *= fr
 
   def scale(self, f: float):
     self.s_ll *= f
@@ -259,6 +280,17 @@ class AngleFactorEstimator:
     for acc in self.lr.values():
       acc[0] *= f
       acc[1] *= f
+    for rec in self.recent.values():
+      rec[0] *= f
+      rec[1] *= f
+
+  def recent_response(self, half: int):
+    """(weight, mean ratio) of the fast tracker for one anchor half; ratio is None until
+    any evidence exists. Ratio 0.93 reads as 'turns 93% of requested'."""
+    w, s = self.recent[half]
+    if w <= 1e-6:
+      return 0.0, None
+    return w, s / w
 
   @property
   def weight_low(self) -> float:
@@ -330,6 +362,7 @@ class AngleFactorEstimator:
       "s_ly": self.s_ly, "s_hy": self.s_hy, "s_w": self.s_w, "s_wy2": self.s_wy2,
       "n": self.n,
       "lr": [self.lr[(h, d)][:] for h in (0, 1) for d in (0, 1)],
+      "recent": [self.recent[0][:], self.recent[1][:]],
     }
 
   def from_dict(self, d: dict):
@@ -345,6 +378,10 @@ class AngleFactorEstimator:
     if isinstance(flat, list) and len(flat) == 4:
       for i, (h, dd) in enumerate(((0, 0), (0, 1), (1, 0), (1, 1))):
         self.lr[(h, dd)] = [float(flat[i][0]), float(flat[i][1])]
+    rec = d.get("recent")  # absent in pre-verify saves: tracker rebuilds in ~a minute
+    if isinstance(rec, list) and len(rec) == 2:
+      for h in (0, 1):
+        self.recent[h] = [float(rec[h][0]), float(rec[h][1])]
 
 
 class QualityMonitor:
@@ -610,9 +647,12 @@ class AutoCalPipeline:
     self.since_nudge_s = NUDGE_PERIOD_S  # first nudge allowed as soon as evidence permits
     self.stable_s = 0.0
     self.nudges = 0
-    self.drive_delta_low = 0.0   # per-drive (process lifetime) — not persisted
-    self.drive_delta_high = 0.0
     self.locked = False
+    # Adjust-then-verify state (persisted): each step opens a window that must be judged
+    # against fresh evidence before its anchor may step again. half 0 = low, 1 = high.
+    self.verify = {0: None, 1: None}     # {"frm": factor, "to": factor, "pre_r": ratio|None}
+    self.verify_result = {0: "", 1: ""}  # last judgment: "confirmed" / "failed" / ""
+    self.verify_hold = {0: 0.0, 1: 0.0}  # extra fresh evidence demanded after a failure
 
   # -- gain model -------------------------------------------------------------------------
   def applied_gain(self, v_ego: float, low_factor: float, high_factor: float) -> float:
@@ -700,6 +740,7 @@ class AutoCalPipeline:
       self.est.decay(self._decay_accum)
       self._decay_accum = 0.0
     self.since_nudge_s += self.dt
+    self._judge_verifies()
 
     sol = self.est.solve()
     if sol is not None:
@@ -716,14 +757,42 @@ class AutoCalPipeline:
 
     return committed
 
+  def _judge_verifies(self):
+    """Judge any pending step once enough FRESH post-step evidence exists. The response
+    ratio scales with the applied gain, so the step predicts its own direction; the fast
+    tracker (reset to zero when the step was taken) says whether the car agreed. Inside
+    VERIFY_OK_BAND of 1.0 is success outright — the step landed where it aimed."""
+    for half in (0, 1):
+      pend = self.verify[half]
+      if pend is None:
+        continue
+      w, r = self.est.recent_response(half)
+      if w < VERIFY_MIN_WEIGHT or r is None:
+        continue  # keep polling — the window stays open until the data has spoken
+      ok = abs(1.0 - r) <= VERIFY_OK_BAND
+      if not ok and pend["pre_r"] is not None:
+        moved_up = pend["to"] > pend["frm"]
+        ok = (r > pend["pre_r"]) if moved_up else (r < pend["pre_r"])
+      elif not ok:
+        ok = True  # no pre-step baseline to contradict (shouldn't happen in practice)
+      self.verify[half] = None
+      if ok:
+        self.verify_result[half] = "confirmed"
+        self.verify_hold[half] = 0.0
+      else:
+        self.verify_result[half] = "failed"
+        self.verify_hold[half] = VERIFY_FAIL_HOLD_WEIGHT
+
   def recommend(self, low_factor: float, high_factor: float):
     """The closed-loop step: propose nudged factor values, or None.
 
     Call once per frame with the currently applied factors; at most one nudge per
-    NUDGE_PERIOD_S of active collection, bounded steps, per-drive cap. The caller
-    applies the returned values (params + in-memory) — they flow back in through
-    update()'s low_factor/high_factor and the loop closes: an overshoot pulls the
-    ratios past 1, the target backs off, the next nudge reverses.
+    NUDGE_PERIOD_S of active collection, one bounded step at a time — but no cumulative
+    cap: total movement is unbounded (within FACTOR_MIN/MAX) as long as every step keeps
+    verifying against fresh evidence. The caller applies the returned values (params +
+    in-memory) — they flow back in through update()'s low_factor/high_factor and the
+    loop closes: an overshoot pulls the ratios past 1, the target backs off, the next
+    nudge reverses.
     """
     if self.locked or self.since_nudge_s < NUDGE_PERIOD_S:
       return None
@@ -732,30 +801,37 @@ class AutoCalPipeline:
       return None
     low_t, high_t, st = sol
 
-    def step(target, applied, weight, stderr_eff, drive_delta, drive_cap):
+    def step(half, target, applied, weight, stderr_eff):
+      if self.verify[half] is not None:
+        return None  # the last step hasn't been judged against fresh evidence yet
       if weight < NUDGE_MIN_WEIGHT or stderr_eff > NUDGE_MAX_STDERR:
         return None
+      if self.verify_hold[half] > 0.0:
+        w_rec, _ = self.est.recent_response(half)
+        if w_rec < self.verify_hold[half]:
+          return None  # a failed check demands extra evidence before moving again
+        self.verify_hold[half] = 0.0
       err = target - applied
       if abs(err) <= NUDGE_DEADBAND:
         return None
       s = max(-NUDGE_STEP, min(NUDGE_STEP, err))
-      if abs(drive_delta + s) > drive_cap:
-        return None  # enough movement for one drive — pick it up next drive
       new = round(max(FACTOR_MIN, min(FACTOR_MAX, applied + s)), 2)
       return new if abs(new - applied) >= 0.005 else None
 
-    new_low = step(low_t, low_factor, st["weight_low"], st["stderr_eff_low"],
-                   self.drive_delta_low, MAX_DRIVE_DELTA_LOW)
-    new_high = step(high_t, high_factor, st["weight_high"], st["stderr_eff_high"],
-                    self.drive_delta_high, MAX_DRIVE_DELTA)
+    new_low = step(0, low_t, low_factor, st["weight_low"], st["stderr_eff_low"])
+    new_high = step(1, high_t, high_factor, st["weight_high"], st["stderr_eff_high"])
     if new_low is None and new_high is None:
       return None
+    # Open a verify window per moved anchor: capture the pre-step response as the
+    # baseline, then zero the fast tracker so the judgment sees only post-step data.
+    for half, applied, new in ((0, low_factor, new_low), (1, high_factor, new_high)):
+      if new is not None:
+        _, pre_r = self.est.recent_response(half)
+        self.verify[half] = {"frm": round(float(applied), 4), "to": new, "pre_r": pre_r}
+        self.verify_result[half] = ""
+        self.est.recent[half] = [0.0, 0.0]
     out_low = new_low if new_low is not None else round(low_factor, 2)
     out_high = new_high if new_high is not None else round(high_factor, 2)
-    if new_low is not None:
-      self.drive_delta_low += out_low - low_factor
-    if new_high is not None:
-      self.drive_delta_high += out_high - high_factor
     self.since_nudge_s = 0.0
     self.stable_s = 0.0
     self.nudges += 1
@@ -770,6 +846,48 @@ class AutoCalPipeline:
     self.stable_s = 0.0
     self.since_nudge_s = 0.0
 
+  # -- live UI state ----------------------------------------------------------------------
+  def ui_state(self, low_factor: float, high_factor: float) -> dict:
+    """Per-anchor state for live dashboards (the phone /lateral page). Everything here is
+    ground truth from the running pipeline — never a param re-read — and rounded hard
+    because it travels as a ~1 Hz telemetry string.
+
+    Per anchor: f applied factor, w/need evidence progress, r recent response ratio
+    ("turns 93% of requested" = 0.93), ph phase (collect / propose / verify / good),
+    t proposed factor (propose), to+vw+vneed step being checked (verify), vr last
+    judgment (confirmed / failed)."""
+    sol = self.est.solve()
+    st = sol[2] if sol is not None else None
+    targets = (sol[0], sol[1]) if sol is not None else (None, None)
+    out = {"nudges": self.nudges, "stable_s": round(self.stable_s)}
+    for half, name, applied in ((0, "low", low_factor), (1, "high", high_factor)):
+      weight = (st["weight_low"] if half == 0 else st["weight_high"]) if st is not None \
+        else (self.est.weight_low if half == 0 else self.est.weight_high)
+      stderr = (st["stderr_eff_low"] if half == 0 else st["stderr_eff_high"]) if st is not None else None
+      w_rec, r_rec = self.est.recent_response(half)
+      target = targets[half]
+      d = {"f": round(float(applied), 2), "w": round(weight, 1), "need": NUDGE_MIN_WEIGHT}
+      if r_rec is not None and w_rec >= 2.0:
+        d["r"] = round(r_rec, 3)
+      if self.verify[half] is not None:
+        d["ph"] = "verify"
+        d["to"] = self.verify[half]["to"]
+        d["vw"] = round(w_rec, 1)
+        d["vneed"] = VERIFY_MIN_WEIGHT
+      elif (target is not None and weight >= NUDGE_MIN_WEIGHT
+            and stderr is not None and stderr <= NUDGE_MAX_STDERR):
+        if abs(target - applied) > NUDGE_DEADBAND:
+          d["ph"] = "propose"
+          d["t"] = round(target, 2)
+        else:
+          d["ph"] = "good"
+      else:
+        d["ph"] = "collect"
+      if self.verify_result[half]:
+        d["vr"] = self.verify_result[half]
+      out[name] = d
+    return out
+
   # -- persistence ------------------------------------------------------------------------
   def to_dict(self) -> dict:
     return {
@@ -780,6 +898,9 @@ class AutoCalPipeline:
       "locked": self.locked,
       "apexes": self.peaks.apexes_committed,
       "rej": dict(self.quality.counters),
+      "verify": [self.verify[0], self.verify[1]],
+      "verify_result": [self.verify_result[0], self.verify_result[1]],
+      "verify_hold": [self.verify_hold[0], self.verify_hold[1]],
     }
 
   def from_dict(self, d: dict):
@@ -792,3 +913,15 @@ class AutoCalPipeline:
     rej = d.get("rej", {})
     for c in REJ_CAUSES:
       self.quality.counters[c] = int(rej.get(c, 0))
+    ver = d.get("verify")  # absent in pre-verify saves: everything simply starts clear
+    if isinstance(ver, list) and len(ver) == 2:
+      for h in (0, 1):
+        self.verify[h] = dict(ver[h]) if isinstance(ver[h], dict) else None
+    vr = d.get("verify_result")
+    if isinstance(vr, list) and len(vr) == 2:
+      for h in (0, 1):
+        self.verify_result[h] = str(vr[h] or "")
+    vh = d.get("verify_hold")
+    if isinstance(vh, list) and len(vh) == 2:
+      for h in (0, 1):
+        self.verify_hold[h] = float(vh[h])

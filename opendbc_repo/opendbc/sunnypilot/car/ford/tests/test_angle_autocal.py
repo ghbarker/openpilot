@@ -13,7 +13,8 @@ from opendbc.sunnypilot.car.ford.angle_autocal import (
   PEAK_MIN_KAPPA, PEAK_PROMINENCE, PEAK_MEDIAN_N, PEAK_WEIGHT_S,
   SPIKE_MEAS_RATE, DISTURBANCE_BLANK_S, ROUGH_RMS_MAX, WS_SPREAD_JUMP,
   TAU_EVIDENCE_S, LR_MIN_WEIGHT, LR_TOL,
-  NUDGE_PERIOD_S, NUDGE_MIN_WEIGHT, NUDGE_DEADBAND, NUDGE_STEP, MAX_DRIVE_DELTA,
+  NUDGE_PERIOD_S, NUDGE_MIN_WEIGHT, NUDGE_DEADBAND, NUDGE_STEP,
+  VERIFY_MIN_WEIGHT, VERIFY_FAIL_HOLD_WEIGHT,
   LOCK_MIN_WEIGHT, LOCK_DEADBAND, LOCK_STABLE_S,
 )
 
@@ -366,26 +367,45 @@ class TestAutoCalPipeline:
     run_pipeline(pipe, 200)
     pipe.stable_s = 123.0
     pipe.nudges = 4
+    pipe.verify_result[0] = "confirmed"
+    pipe.verify_hold[1] = 12.0
     d = json.loads(json.dumps(pipe.to_dict()))
     pipe2 = AutoCalPipeline(PLATFORM_GAIN_HIGH)
     pipe2.from_dict(d)
     assert pipe2.est.solve() == pipe.est.solve()
     assert pipe2.stable_s == 123.0 and pipe2.nudges == 4 and not pipe2.locked
+    assert pipe2.verify_result[0] == "confirmed" and pipe2.verify_hold[1] == 12.0
+
+
+def _evidenced_pipe(true_low=1.10, true_high=1.10, applied=(1.0, 1.0), weight_s=15.0):
+  """Pipeline with clean steady evidence at both anchors against a known plant."""
+  pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH)
+  n = int(weight_s / DT)
+  for v, kappa in ((10.0, 0.004), (28.0, 0.0015)):
+    g = applied_gain(v, *applied)
+    r = g / ideal_gain(v, true_low, true_high)
+    pipe.gate.steady_s = 0.0
+    pipe._meas_last = None
+    for _ in range(n):
+      pipe.update(_frame(v, kappa, kappa * r, low=applied[0], high=applied[1]))
+  return pipe
+
+
+def _feed_low(pipe, applied, seconds, true_low, true_high, ratio_scale=1.0,
+              v=10.0, kappa=0.004):
+  """Steady low-band frames from the plant under the given applied factors; ratio_scale
+  != 1 makes the car respond off-model (the adjust-then-verify failure case)."""
+  g = applied_gain(v, applied[0], applied[1])
+  r = g / ideal_gain(v, true_low, true_high) * ratio_scale
+  pipe.gate.steady_s = 0.0
+  pipe._meas_last = None
+  for _ in range(int(seconds / DT)):
+    pipe.update(_frame(v, kappa, kappa * r, low=applied[0], high=applied[1]))
 
 
 class TestFactorNudger:
-  def _evidenced_pipe(self, true_low=1.10, true_high=1.10, applied=(1.0, 1.0), weight_s=15.0):
-    """Pipeline with clean steady evidence at both anchors against a known plant."""
-    pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH)
-    n = int(weight_s / DT)
-    for v, kappa in ((10.0, 0.004), (28.0, 0.0015)):
-      g = applied_gain(v, *applied)
-      r = g / ideal_gain(v, true_low, true_high)
-      pipe.gate.steady_s = 0.0
-      pipe._meas_last = None
-      for _ in range(n):
-        pipe.update(_frame(v, kappa, kappa * r, low=applied[0], high=applied[1]))
-    return pipe
+  def _evidenced_pipe(self, **kw):
+    return _evidenced_pipe(**kw)
 
   def test_nudges_toward_target_bounded(self):
     pipe = self._evidenced_pipe(true_low=1.10, true_high=1.10)
@@ -412,21 +432,22 @@ class TestFactorNudger:
     pipe = self._evidenced_pipe(weight_s=NUDGE_MIN_WEIGHT * 0.3)
     assert pipe.recommend(1.0, 1.0) is None
 
-  def test_per_drive_cap(self):
+  def test_no_cumulative_cap_walks_to_the_fit(self):
+    # 2026-07-22 design decision: no per-drive movement cap. A car that is genuinely
+    # 40% off must be allowed to walk all the way in one drive, as long as every step
+    # keeps verifying against fresh evidence (the plant here always agrees).
     pipe = self._evidenced_pipe(true_low=1.40, true_high=1.40)
     applied = [1.0, 1.0]
-    moved = 0.0
-    for _ in range(30):  # far more opportunities than the cap allows
+    for _ in range(30):
       for _f in range(int(NUDGE_PERIOD_S / DT) + 1):
         g = applied_gain(10.0, *applied)
         r = g / ideal_gain(10.0, 1.40, 1.40)
         pipe.update(_frame(10.0, 0.004, 0.004 * r, low=applied[0], high=applied[1]))
       rec = pipe.recommend(*applied)
       if rec is not None:
-        moved += abs(rec[0] - applied[0])
         applied = list(rec)
-    assert moved <= MAX_DRIVE_DELTA + 1e-9
-    assert pipe.drive_delta_low <= MAX_DRIVE_DELTA + 1e-9
+    assert applied[0] >= 1.35, applied      # far past the old 0.04/0.10 caps
+    assert pipe.verify_result[0] == "confirmed"  # and every step was checked on the way
 
   def test_user_edit_soft_resets(self):
     pipe = self._evidenced_pipe()
@@ -437,6 +458,95 @@ class TestFactorNudger:
     assert pipe.stable_s == 0.0
     # Evidence NOT wiped: the fit is still there, just less confident.
     assert pipe.est.solve() is not None
+
+
+class TestAdjustVerify:
+  """Every step is judged against FRESH post-step evidence before its anchor may step
+  again — the no-cap regime's runaway protection ('poll a couple turns, adjust, poll
+  some more', made enforceable)."""
+
+  def test_step_opens_verify_window(self):
+    pipe = _evidenced_pipe()
+    rec = pipe.recommend(1.0, 1.0)
+    assert rec is not None
+    assert pipe.verify[0] is not None and pipe.verify[0]["to"] == rec[0]
+    assert pipe.est.recent[0] == [0.0, 0.0]  # the judgment sees only post-step data
+
+  def test_no_second_step_until_fresh_evidence(self):
+    pipe = _evidenced_pipe(true_low=1.40, true_high=1.40)
+    rec = pipe.recommend(1.0, 1.0)
+    assert rec is not None
+    # Advance the nudge clock with frames that carry NO evidence (below MIN_KAPPA):
+    # plenty of time passes, but the step has not been answered by data.
+    for _ in range(int(NUDGE_PERIOD_S / DT) + 1):
+      pipe.update(_frame(10.0, 0.0005, 0.0005, low=rec[0], high=rec[1]))
+    assert pipe.recommend(*rec) is None       # window still open
+    # Fresh agreeing evidence arrives: the step is judged and the walk continues.
+    _feed_low(pipe, rec, VERIFY_MIN_WEIGHT + 3.0, 1.40, 1.40)
+    assert pipe.verify[0] is None
+    assert pipe.verify_result[0] == "confirmed"
+    assert pipe.recommend(*rec) is not None
+
+  def test_failed_verify_holds_anchor(self):
+    pipe = _evidenced_pipe(true_low=1.10, true_high=1.10)
+    rec = pipe.recommend(1.0, 1.0)
+    assert rec is not None and rec[0] > 1.0   # stepped UP toward the fit
+    # Contrarian car: after the step up, the measured response DROPS — the data
+    # contradicts the model, so the step must not be trusted.
+    _feed_low(pipe, rec, VERIFY_MIN_WEIGHT + 3.0, 1.10, 1.10, ratio_scale=0.85)
+    assert pipe.verify_result[0] == "failed"
+    assert pipe.verify_hold[0] == VERIFY_FAIL_HOLD_WEIGHT
+    # Kill more clock without evidence: still held (fresh weight < the fail demand).
+    for _ in range(int(NUDGE_PERIOD_S / DT) + 1):
+      pipe.update(_frame(10.0, 0.0005, 0.0005, low=rec[0], high=rec[1]))
+    assert pipe.recommend(*rec) is None
+    # Twice the evidence arrives and keeps asking for movement: the hold releases.
+    _feed_low(pipe, rec, VERIFY_FAIL_HOLD_WEIGHT + 4.0, 1.10, 1.10, ratio_scale=0.85)
+    assert pipe.recommend(*rec) is not None
+
+  def test_verify_state_survives_serialization(self):
+    pipe = _evidenced_pipe()
+    rec = pipe.recommend(1.0, 1.0)
+    assert rec is not None
+    d = json.loads(json.dumps(pipe.to_dict()))
+    pipe2 = AutoCalPipeline(PLATFORM_GAIN_HIGH)
+    pipe2.from_dict(d)
+    assert pipe2.verify[0] == pipe.verify[0]
+    assert pipe2.est.recent == pipe.est.recent
+
+
+class TestRecentResponse:
+  def test_tracks_current_ratio(self):
+    est = AngleFactorEstimator(PLATFORM_GAIN_HIGH)
+    g = applied_gain(10.0, 1.0, 1.0)
+    for _ in range(100):
+      est.add_sample(10.0, 0.002, 0.002 * 0.93, g, weight=DT)
+    w, r = est.recent_response(0)
+    assert abs(r - 0.93) < 1e-9 and w > 4.0   # "turns 93% of requested"
+    assert est.recent_response(1)[1] is None  # no high-band evidence yet
+
+
+class TestUiState:
+  def test_propose_then_verify_phases(self):
+    pipe = _evidenced_pipe(true_low=1.10, true_high=1.10)
+    ui = pipe.ui_state(1.0, 1.0)
+    assert ui["low"]["ph"] == "propose" and ui["low"]["t"] > 1.0
+    assert abs(ui["low"]["r"] - 1.0 / 1.10) < 0.02
+    json.dumps(ui)  # must survive the telemetry string
+    rec = pipe.recommend(1.0, 1.0)
+    ui = pipe.ui_state(*rec)
+    assert ui["low"]["ph"] == "verify" and ui["low"]["to"] == rec[0]
+
+  def test_collect_phase_before_evidence(self):
+    pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH)
+    ui = pipe.ui_state(1.0, 1.0)
+    assert ui["low"]["ph"] == "collect" and ui["high"]["ph"] == "collect"
+    json.dumps(ui)
+
+  def test_good_phase_when_matched(self):
+    pipe = _evidenced_pipe(true_low=1.0, true_high=1.0)
+    ui = pipe.ui_state(1.0, 1.0)
+    assert ui["low"]["ph"] == "good" and ui["high"]["ph"] == "good"
 
 
 class TestClosedLoopConvergence:
@@ -524,6 +634,8 @@ class _MockParams:
     "FordHighSpeedFactor_ang": float,
     "FordAngleAutoCal": bool,
     "FordAngleAutoCalState": str,
+    "FordAngleAutoCalError": str,
+    "FordAngleAutoCalReset": bool,
     "lane_change_factor_high_ang": float,
   }
 
@@ -543,6 +655,9 @@ class _MockParams:
       raise TypeError(f"Type mismatch while writing param {key}: got {type(value)}, expected {expected}")
     self.values[key] = value
     self.written[key] = value
+
+  def put_bool(self, key, value):
+    self.put(key, bool(value))
 
 
 class TestOnboardGlue:
@@ -656,6 +771,34 @@ class TestOnboardGlue:
     ext2.update_angle_params(p)
     assert ext2.autocal_ctl.pipeline is not None
     assert ext2.autocal_ctl.pipeline.est.solve() == sol
+
+  def test_reset_param_erases_everything(self):
+    # The "erase calibration memory" button: evidence, error log, the LOCK, and the
+    # factors themselves all go back to neutral — a finished calibration can be retried.
+    ext = self._ext()
+    state = json.dumps({"v": 1, "phase": "locked", "pipe": {}})
+    p = _MockParams({"FordAngleAutoCal": 1, "FordAngleAutoCalState": state,
+                     "FordAngleAutoCalReset": 1,
+                     "FordLowSpeedFactor_ang": "1.12", "FordHighSpeedFactor_ang": "1.20"})
+    ext.update_angle_params(p)  # first ~1 Hz tick consumes the reset
+    assert p.values["FordAngleAutoCalReset"] is False
+    assert p.values["FordAngleAutoCalState"] == "" and p.values["FordAngleAutoCalError"] == ""
+    assert p.written["FordLowSpeedFactor_ang"] == 1.0 and p.written["FordHighSpeedFactor_ang"] == 1.0
+    assert ext.autocal_ctl.status == "reset" and not ext.autocal_ctl.done
+    # Next tick arms a FRESH collection despite the previously locked state.
+    self._tick(ext, p, n=1)
+    assert ext.autocal_ctl.pipeline is not None and ext.autocal_ctl.pipeline.est.n == 0
+    assert ext.autocal_ctl._last_written == (1.0, 1.0)  # the wipe is not a "user edit"
+    assert ext.low_speed_curv_factor == 1.0 and ext.high_speed_curv_factor == 1.0
+
+  def test_status_is_json_when_armed(self):
+    ext = self._ext()
+    p = _MockParams({"FordAngleAutoCal": 1, "FordAngleAutoCalState": "",
+                     "FordLowSpeedFactor_ang": "1.00", "FordHighSpeedFactor_ang": "1.00"})
+    self._tick(ext, p, n=1)
+    st = json.loads(ext.autocal_ctl.status)  # dashboards parse this
+    assert st["low"]["ph"] == "collect" and st["high"]["f"] == 1.0
+    assert st["low"]["need"] == NUDGE_MIN_WEIGHT
 
   def test_toggle_off_disarms(self):
     ext = self._ext()

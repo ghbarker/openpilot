@@ -67,6 +67,26 @@ class AutoCalController:
     """Arm/disarm from the toggle, restore evidence on arm, detect user hand-edits of the
     factor params, refresh the status string. low/high are the currently applied values."""
     try:
+      if params.get_bool("FordAngleAutoCalReset"):
+        # Erase calibration memory (settings button / any params writer): evidence, the
+        # error channel, the lock, AND the factors themselves go back to neutral — the
+        # strategy re-reads the factor params within a frame, so the car steers stock
+        # immediately and collection restarts from nothing on the next tick if the
+        # toggle is on. The UI clears the string params itself for offroad visibility;
+        # doing it again here is idempotent and covers non-UI writers.
+        params.put_bool("FordAngleAutoCalReset", False)
+        params.put("FordAngleAutoCalState", "")
+        params.put("FordAngleAutoCalError", "")
+        params.put("FordLowSpeedFactor_ang", 1.0)
+        params.put("FordHighSpeedFactor_ang", 1.0)
+        self.pipeline = None
+        self.done = False
+        self._last_written = (1.0, 1.0)
+        self._edit_pending = False
+        self._dirty = False
+        self._params = params
+        self.status = "reset"
+        return
       enabled = bool(params.get_bool("FordAngleAutoCal"))
       state = params.get("FordAngleAutoCalState", return_default=True) or ""
       if isinstance(state, bytes):
@@ -112,10 +132,12 @@ class AutoCalController:
       elif not self.enabled:
         self.status = "off"
       else:
-        est = self.pipeline.est
-        self.status = (f"armed n={est.n} w={est.weight_low:.0f}/{est.weight_high:.0f}"
-                       f" applied={low_factor:.2f}/{high_factor:.2f}"
-                       f" nudges={self.pipeline.nudges}")
+        # Armed: compact JSON so live dashboards (phone /lateral cards) can render the
+        # per-anchor story — evidence progress, measured response, proposed step, and
+        # the adjust-then-verify judgment — from the same ground truth the nudger uses.
+        ui = self.pipeline.ui_state(low_factor, high_factor)
+        ui["n"] = self.pipeline.est.n
+        self.status = json.dumps(ui, separators=(",", ":"))
     except Exception as e:
       self.enabled = False
       self.status = f"tick error: {type(e).__name__}: {e}"[:200]
