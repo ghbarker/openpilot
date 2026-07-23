@@ -413,24 +413,36 @@ class LateralAngleExt:
     LP = self.lp
     desired_curvature = float(actuators.curvature)
 
-    # Variable lookup time: t_base tracks planner pre-compensation; extra tapers on high speed and large curves.
-    # Cap liveDelay at 0.15s for VLT purposes. liveDelay can calibrate up to ~420ms on some runs, which inflates
-    # VLT to 0.6s and pushes the model lookahead 5m into the curve. At that depth the model sees full peak
-    # curvature, kappa_entering stays True, and the exit-biased blend is permanently disabled — causing the car
-    # to command max path_angle through the entire apex. 0.15s gives t_base ≤ 0.20s and VLT ≤ 0.33s, restoring
-    # the 2.8m lookahead that kept kappa_entering False at the apex in successful earlier runs.
-    _t_base = float(clip(self.sm['liveDelay'].lateralDelay, 0.1, 0.15)) + _DT_MDL
+    # Variable lookup time — delay compensation is SPLIT across two horizons (2026-07-23):
+    #  - _t_entering (liveDelay capped 0.15s): the horizon for the entering/exiting DECISION
+    #    only. The cap is load-bearing for apexes: a deeper decision horizon keeps
+    #    kappa_entering True through the apex — the 0.42s-liveDelay era pathology where the
+    #    exit-biased blend never engaged and the command flat-lined at max through the apex.
+    #    A replay regression across 308 real apexes (routes 0a/0b/12/1b) showed even a
+    #    0.25s decision horizon regresses 7.5% of them, so this horizon stays short and the
+    #    apex behavior stays identical by construction.
+    #  - _t_base (liveDelay capped 0.30s): the model-prediction LEAD in the blend. The true
+    #    actuation delay is ~0.29s (liveDelay median, confirmed by command/measurement
+    #    cross-correlation on three drives); compensating only 0.15s of it left ~0.14s of
+    #    known-but-ignored delay in the loop, driving a ~0.2 Hz closed-loop breathing
+    #    (±0.5° at the wheel, in curves and straights alike — measured desired-osc 0.15,
+    #    actual-osc 0.21 mrad/m, actual trailing desired by exactly the actuation delay).
+    #    Exits stay protected regardless of this deeper lead: the exit-biased blend
+    #    collapses the prediction weight to ~15% there.
+    _t_entering = float(clip(self.sm['liveDelay'].lateralDelay, 0.1, 0.15)) + _DT_MDL
+    _t_base = float(clip(self.sm['liveDelay'].lateralDelay, 0.1, 0.30)) + _DT_MDL
     _speed_factor = float(interp(v_ego, [_VLT_V_LOW_MS, _VLT_V_HIGH_MS], [1.0, 0.0]))
     # Direction-aware kappa factor: on curve ENTRY (model shows more curvature at t_base than planner now),
     # keep full lookahead so pre-steering begins early. On exit/apex, taper by magnitude to prevent unwind.
-    _kappa_at_t_base = 0.0
+    _kappa_at_entering = 0.0
     if self.model is not None and len(self.model.orientationRate.z) >= 17:
       _curvatures_ref = np.array(self.model.orientationRate.z) / max(0.01, v_ego)
-      _kappa_at_t_base = abs(float(interp(_t_base, ModelConstants.T_IDXS, _curvatures_ref)))
+      # Decision horizon (_t_entering, short by design) — NOT the blend lead horizon.
+      _kappa_at_entering = abs(float(interp(_t_entering, ModelConstants.T_IDXS, _curvatures_ref)))
     # Anti-weave: hysteresis so noise straddling the entering/exiting boundary can't flip
     # this boolean (and with it the exit-blend gate) frame to frame near zero curvature.
-    _kappa_entering = self.smoother.entering(_kappa_at_t_base - abs(desired_curvature),
-                                             _kappa_at_t_base > abs(desired_curvature))
+    _kappa_entering = self.smoother.entering(_kappa_at_entering - abs(desired_curvature),
+                                             _kappa_at_entering > abs(desired_curvature))
     if _kappa_entering:
       _kappa_factor = 1.0  # curve deepening ahead: full extra lookahead for gradual entry
     else:
