@@ -56,20 +56,27 @@ class Frame:
   ws_spread: float | None
   low_factor: float
   high_factor: float
+  lateral_delay: float  # liveDelay.lateralDelay (s) — evidence is aligned against cmd(t - delay)
 
 # Sample admission gates (mirrored by both the offline analyzer and the onboard hook).
 MIN_SPEED = 9.5             # m/s; below this the deviation clip is off and measurement is noisy
 MIN_KAPPA = 0.001           # 1/m; fully inside the high-curvature branch the factors scale
-MAX_KAPPA_RATE = 0.0015     # 1/m/s; quasi-steady curvature only
-STEADY_TIME_S = 0.6         # command must be steady this long before samples count (PSCM lag)
-# The measurement lags the command by the actuation delay (liveDelay: ~0.15s typical, up to
-# ~0.42s observed), so on a slow ramp a same-frame ratio compares meas(t) ~ cmd(t - tau)
-# against cmd(t). The per-frame rate bound alone admits ramps whose lag error reaches
-# tau*MAX_KAPPA_RATE/kappa — tens of percent at the MIN_KAPPA floor. Bounding the TOTAL
-# drift across the steady window caps that error at DRIFT_FRAC * (tau / STEADY_TIME_S)
-# regardless of the actual delay: <= ~7% instantaneous even at the 0.42s extreme, sign-
-# symmetric over entries/exits, well inside the stderr machinery.
-STEADY_DRIFT_FRAC = 0.10    # max |kappa - window start| as a fraction of |kappa|
+# --- Lag-aligned steadiness --------------------------------------------------------------
+# The measurement lags the command by the actuation delay (liveDelay: ~0.15-0.30s typical,
+# up to ~0.42s observed). Evidence ratios are therefore taken against the command from
+# lateral_delay seconds AGO (a short ring buffer in the pipeline), which removes the
+# first-order lag bias outright instead of demanding a nearly frozen command. What remains
+# is the DELAY ESTIMATE's own error (~±0.1s), so the bounds below only need to keep
+# kappa's fractional change over that residual small: bias ≈ tau_err * |dk/dt| / |k| —
+# at the 0.5/s relative bound and 0.1s residual, <= 5%, sign-symmetric over entries and
+# exits, inside the stderr machinery. Validated on-road 2026-07-22 (routes 0b/12/13):
+# vs the old frozen-command gate this recovers 3-5x the evidence on winding roads with
+# the pooled fit unchanged (high 1.127 before and after, stderr 0.033 -> 0.012).
+LAG_MIN_S, LAG_MAX_S = 0.10, 0.42  # trust clamp for the liveDelay estimate
+MAX_KAPPA_RATE = 0.0015     # 1/m/s absolute floor of the admission rate bound
+REL_KAPPA_RATE = 0.5        # 1/s: |dk/dt| may reach this fraction of |k| (winding roads)
+STEADY_TIME_S = 0.3         # command steady this long before samples count (PSCM settle)
+STEADY_DRIFT_FRAC = 0.25    # max |kappa - window start| as a fraction of |kappa|
 MIN_RATIO, MAX_RATIO = 0.4, 2.5  # discard absurd ratios (measurement glitches)
 MAX_LAT_ACCEL = 2.5         # m/s^2; kappa*v^2 above this is tire/comfort-limit territory, not gain error
 # Near the limit cmd!=meas is physics, not gain error: evidence weight fades linearly to
@@ -606,7 +613,11 @@ class SteadyStateGate:
                         and not saturated)
     ok = lat_active and self.frame_clear and abs(kappa_cmd) >= MIN_KAPPA
     if ok and self.kappa_last is not None:
-      ok = abs(kappa_cmd - self.kappa_last) / self.dt <= MAX_KAPPA_RATE
+      # Relative rate bound with an absolute floor: lag alignment absorbs the transport
+      # delay, so kappa is allowed to actually MOVE (winding roads) — the bound only has
+      # to cap the residual delay-estimate error's effect (see the constants block).
+      ok = (abs(kappa_cmd - self.kappa_last) / self.dt
+            <= max(MAX_KAPPA_RATE, REL_KAPPA_RATE * abs(kappa_cmd)))
     # Actuation-lag protection: per-frame rate alone admits slow ramps whose same-frame
     # ratio is lag-biased; the window-total drift bound caps that (see STEADY_DRIFT_FRAC).
     if ok and self.kappa_window_start is not None:
@@ -643,6 +654,10 @@ class AutoCalPipeline:
     self._staged: list[list] = []  # [age_s, v, kappa_cmd, kappa_meas, applied_gain, weight]
     self._meas_last = None
     self._decay_accum = 0.0
+    # Lag alignment: ring of recent (kappa_cmd, applied_gain) so this frame's measurement
+    # can be ratioed against the command (and the gain in force) when it was ISSUED.
+    self._hist: list[tuple[float, float]] = []
+    self._hist_max = int(round(LAG_MAX_S / dt)) + 2
     # Nudge / lock bookkeeping (persisted).
     self.since_nudge_s = NUDGE_PERIOD_S  # first nudge allowed as soon as evidence permits
     self.stable_s = 0.0
@@ -666,6 +681,7 @@ class AutoCalPipeline:
     self.peaks.clear()
     self._staged.clear()
     self._meas_last = None
+    self._hist.clear()  # commands across a discontinuity must never be an alignment target
 
   def update(self, frame: Frame) -> list:
     """Advance one frame. frame.low_factor/high_factor are the values currently steering
@@ -675,12 +691,30 @@ class AutoCalPipeline:
     if self.locked:
       return []
     v_ego, kappa_cmd, kappa_meas = frame.v_ego, frame.kappa_cmd, frame.kappa_meas
+    gain_now = self.applied_gain(v_ego, frame.low_factor, frame.high_factor)
 
-    # The gate computes grip + the per-frame admission predicate once; everything
-    # below reads them back instead of keeping a hand-synced copy.
-    eligible = self.gate.update(True, kappa_cmd, frame.steering_pressed,
-                                frame.angle_rate_limited, frame.deviation_limited,
-                                saturated=frame.saturated, driver_torque=frame.driver_torque)
+    # Lag alignment: this frame's MEASUREMENT answers the command from lateral_delay ago.
+    # All steadiness gating and every steady-state ratio below use that reference pair
+    # (cmd + the gain in force when it was issued); the apex path keeps its own explicit
+    # lag matching and stays on the current command.
+    self._hist.append((kappa_cmd, gain_now))
+    if len(self._hist) > self._hist_max:
+      self._hist.pop(0)
+    lag_f = int(round(min(max(frame.lateral_delay, LAG_MIN_S), LAG_MAX_S) / self.dt))
+    aligned = len(self._hist) > lag_f
+    kappa_ref, gain_ref = self._hist[-1 - lag_f] if aligned else (0.0, gain_now)
+
+    if aligned:
+      # The gate computes grip + the per-frame admission predicate once; everything
+      # below reads them back instead of keeping a hand-synced copy.
+      eligible = self.gate.update(True, kappa_ref, frame.steering_pressed,
+                                  frame.angle_rate_limited, frame.deviation_limited,
+                                  saturated=frame.saturated, driver_torque=frame.driver_torque)
+    else:
+      # Not enough history yet (first ~lateral_delay after engaging): no steady evidence,
+      # and the gate restarts so its baselines never straddle the warmup.
+      self.gate.reset()
+      eligible = False
     if self.gate.grip_this_frame:
       self._staged.clear()
       self.quality.counters["grip"] += 1
@@ -696,9 +730,11 @@ class AutoCalPipeline:
     # The CAR must be settled too, not just the command: during closed-loop compensation
     # swings (understeer -> harder request -> convergence tail) the command can sit steady
     # while the measurement is still moving toward it — those ratios are transient, not
-    # gain. Measured curvature is noisier than the command, so the bound is 3x looser.
+    # gain. The measurement legitimately moves as fast as the (lag-aligned) command does,
+    # and it is noisier — so the bound is 3x the command's own admission bound.
     if eligible and self._meas_last is not None:
-      eligible = abs(kappa_meas - self._meas_last) / self.dt <= 3.0 * MAX_KAPPA_RATE
+      eligible = (abs(kappa_meas - self._meas_last) / self.dt
+                  <= 3.0 * max(MAX_KAPPA_RATE, REL_KAPPA_RATE * abs(kappa_ref)))
     self._meas_last = kappa_meas
 
     # Evidence near the physical limit fades to nothing: there, cmd != meas is physics.
@@ -707,8 +743,6 @@ class AutoCalPipeline:
     if eligible and margin_w <= 0.0:
       self.quality.counters["limit"] += 1
       eligible = False
-
-    gain_now = self.applied_gain(v_ego, frame.low_factor, frame.high_factor)
 
     # Age the staging queue; entries that survived the holdback graduate to the estimator.
     committed = []
@@ -723,7 +757,7 @@ class AutoCalPipeline:
     self._staged = still_staged
 
     if eligible:
-      self._staged.append([0.0, v_ego, kappa_cmd, kappa_meas, gain_now, self.dt * margin_w])
+      self._staged.append([0.0, v_ego, kappa_ref, kappa_meas, gain_ref, self.dt * margin_w])
 
     # Apex evidence: gated by everything EXCEPT the steadiness timer (an apex is by
     # definition not steady). Quality, grip, limit flags all poison the window —

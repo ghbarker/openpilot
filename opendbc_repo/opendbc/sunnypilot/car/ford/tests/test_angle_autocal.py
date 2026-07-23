@@ -8,7 +8,7 @@ import pytest
 from opendbc.sunnypilot.car.ford.angle_autocal import (
   Frame,
   AngleFactorEstimator, AutoCalPipeline, PeakMatcher, QualityMonitor, SteadyStateGate,
-  speed_alpha, V_LOW, V_HIGH, LOW_ANCHOR_BASE, STEADY_TIME_S, MIN_KAPPA,
+  speed_alpha, V_LOW, V_HIGH, LOW_ANCHOR_BASE, STEADY_TIME_S, MIN_KAPPA, REL_KAPPA_RATE,
   PRESS_HOLDBACK_S, PRESS_COOLDOWN_S, MAX_LAT_ACCEL, MAX_LONG_ACCEL,
   PEAK_MIN_KAPPA, PEAK_PROMINENCE, PEAK_MEDIAN_N, PEAK_WEIGHT_S,
   SPIKE_MEAS_RATE, DISTURBANCE_BLANK_S, ROUGH_RMS_MAX, WS_SPREAD_JUMP,
@@ -133,21 +133,29 @@ class TestSteadyStateGate:
     gate.update(True, MIN_KAPPA * 2, True, False, False)  # pressed
     assert gate.steady_s == 0.0
 
-  def test_slow_ramp_bounded_by_window_drift(self):
-    # A ramp inside the per-frame rate bound but drifting through the window must not
-    # pass: the same-frame ratio would be actuation-lag-biased (liveDelay up to ~0.42s).
+  def test_ramp_within_relative_bound_admitted(self):
+    # Lag alignment absorbs the transport delay, so a genuinely winding road — kappa
+    # moving at up to REL_KAPPA_RATE of itself — IS evidence now. This ramp (25%/s
+    # relative) was rejected by the old frozen-command gate; that starvation discarded
+    # 89-100% of clean curve time on real winding-road drives (2026-07-22 analysis).
     gate = SteadyStateGate(dt=DT)
-    k = MIN_KAPPA * 2
+    k = MIN_KAPPA * 3
     admitted = False
-    for _ in range(int(STEADY_TIME_S / DT) * 4):
+    for _ in range(int(STEADY_TIME_S / DT) * 6):
       admitted |= gate.update(True, k, False, False, False)
-      k += 0.5 * 0.0015 * DT   # half the per-frame rate limit, sustained
+      k += 0.25 * k * DT
+    assert admitted
+
+  def test_ramp_beyond_relative_bound_rejected(self):
+    # Twice the relative bound: the residual delay-estimate error would bias these
+    # ratios beyond what the stderr machinery is sized for — still rejected.
+    gate = SteadyStateGate(dt=DT)
+    k = MIN_KAPPA * 3
+    admitted = False
+    for _ in range(int(STEADY_TIME_S / DT) * 6):
+      admitted |= gate.update(True, k, False, False, False)
+      k += 2.0 * REL_KAPPA_RATE * k * DT
     assert not admitted
-    # A truly flat command still passes — one extra frame for the drift reset that
-    # closes the ramp's stale window, then a full fresh steady period.
-    for _ in range(int(STEADY_TIME_S / DT) + 3):
-      ok = gate.update(True, k, False, False, False)
-    assert ok
 
   def test_saturation_blocks(self):
     gate = SteadyStateGate(dt=DT)
@@ -304,14 +312,14 @@ def run_pipeline(pipe, n, torque=0.0, pressed=False, saturated=False, kappa=0.00
 class TestAutoCalPipeline:
   def test_commits_after_holdback(self):
     pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH)
-    warm = int((STEADY_TIME_S + PRESS_HOLDBACK_S) / DT) + 3
+    warm = int((STEADY_TIME_S + PRESS_HOLDBACK_S) / DT) + 3 + _LAG_F
     committed = run_pipeline(pipe, warm)
     assert pipe.est.n > 0
     assert len(committed) == pipe.est.n
 
   def test_grip_cancels_staged_samples(self):
     pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH)
-    warm = int(STEADY_TIME_S / DT) + 1 + int(PRESS_HOLDBACK_S / DT) // 2
+    warm = int(STEADY_TIME_S / DT) + 1 + int(PRESS_HOLDBACK_S / DT) // 2 + _LAG_F
     run_pipeline(pipe, warm)
     assert len(pipe._staged) > 0 and pipe.est.n == 0
     pipe.update(_frame(20.0, 0.002, 0.002, pressed=True))  # grip
@@ -320,7 +328,7 @@ class TestAutoCalPipeline:
 
   def test_disturbance_cancels_staged_samples(self):
     pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH)
-    warm = int(STEADY_TIME_S / DT) + 1 + int(PRESS_HOLDBACK_S / DT) // 2
+    warm = int(STEADY_TIME_S / DT) + 1 + int(PRESS_HOLDBACK_S / DT) // 2 + _LAG_F
     run_pipeline(pipe, warm)
     assert len(pipe._staged) > 0 and pipe.est.n == 0
     # Bump: measured curvature jumps while the command sits still.
@@ -337,10 +345,11 @@ class TestAutoCalPipeline:
 
   def test_idle_clears_staging(self):
     pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH)
-    run_pipeline(pipe, int(STEADY_TIME_S / DT) + 5)
+    run_pipeline(pipe, int(STEADY_TIME_S / DT) + 5 + _LAG_F)
     assert len(pipe._staged) > 0
     pipe.idle()
     assert len(pipe._staged) == 0 and pipe.gate.steady_s == 0.0
+    assert pipe._hist == []  # alignment must never target commands across a discontinuity
 
   def test_unsettled_measurement_not_staged(self):
     pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH)
@@ -386,6 +395,7 @@ def _evidenced_pipe(true_low=1.10, true_high=1.10, applied=(1.0, 1.0), weight_s=
     r = g / ideal_gain(v, true_low, true_high)
     pipe.gate.steady_s = 0.0
     pipe._meas_last = None
+    pipe._hist.clear()  # speed-block boundary: never align against the other block's cmd
     for _ in range(n):
       pipe.update(_frame(v, kappa, kappa * r, low=applied[0], high=applied[1]))
   return pipe
@@ -399,6 +409,7 @@ def _feed_low(pipe, applied, seconds, true_low, true_high, ratio_scale=1.0,
   r = g / ideal_gain(v, true_low, true_high) * ratio_scale
   pipe.gate.steady_s = 0.0
   pipe._meas_last = None
+  pipe._hist.clear()
   for _ in range(int(seconds / DT)):
     pipe.update(_frame(v, kappa, kappa * r, low=applied[0], high=applied[1]))
 
@@ -458,6 +469,62 @@ class TestFactorNudger:
     assert pipe.stable_s == 0.0
     # Evidence NOT wiped: the fit is still there, just less confident.
     assert pipe.est.solve() is not None
+
+
+class TestLagAlignment:
+  """The 2026-07-22 evidence-starvation fix: ratios are taken against the command from
+  lateral_delay ago, so winding roads (a moving command) become usable evidence without
+  lag bias — the exact scenario the old frozen-command gate had to discard."""
+
+  def _ramped_pipe(self, true_gain_ratio, lag_frames=4, n=1200, rel_rate=0.25):
+    """Plant with a PURE transport delay: meas(t) = ratio * cmd(t - lag). The command
+    ramps continuously at rel_rate (within the admission bound) — under the old gate
+    this drive yields nothing; under alignment it must recover the ratio exactly."""
+    pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH)
+    hist = []
+    k = 0.002
+    for _ in range(n):
+      hist.append(k)
+      k_meas = true_gain_ratio * (hist[-1 - lag_frames] if len(hist) > lag_frames else 0.0)
+      pipe.update(_frame(10.0, k, k_meas, lat_delay=lag_frames * DT))
+      k *= 1.0 + rel_rate * DT
+      if k > 0.004:
+        k = 0.002  # saw-tooth reset; the drop is a huge rate step the gate must absorb
+    return pipe
+
+  def test_recovers_ratio_from_delayed_moving_command(self):
+    # Car delivers 90% of requested with a 0.2s transport delay, command always moving.
+    pipe = self._ramped_pipe(0.90)
+    assert pipe.est.n > 100  # the old gate got ~zero here
+    _w, r = pipe.est.recent_response(0)  # all evidence at v=10 -> low half
+    assert r is not None and abs(r - 0.90) < 0.005, r  # aligned ratio is exact, not lag-biased
+
+  def test_same_frame_ratio_would_have_been_biased(self):
+    # Sanity for the whole design: on this plant the same-frame ratio is NOT the gain —
+    # the lag makes it read low on a rising ramp. Alignment is what removes that bias.
+    k = 0.002
+    hist = []
+    biased = []
+    for _ in range(200):
+      hist.append(k)
+      if len(hist) > 4:
+        biased.append((0.90 * hist[-5]) / k)
+      k *= 1.0 + 0.25 * DT
+    assert max(biased) < 0.90 - 0.01  # every same-frame sample reads low
+
+  def test_no_evidence_before_history_fills(self):
+    pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH)
+    for _ in range(_LAG_F - 2):
+      pipe.update(_frame(10.0, 0.003, 0.003))
+    assert pipe._staged == [] and pipe.est.n == 0
+
+  def test_delay_clamped_to_trust_window(self):
+    # An absurd liveDelay value must not demand an absurd history depth.
+    pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH)
+    warm = int((STEADY_TIME_S + PRESS_HOLDBACK_S) / DT) + 3 + int(round(0.42 / DT)) + 1
+    for _ in range(warm):
+      pipe.update(_frame(10.0, 0.003, 0.003, lat_delay=5.0))
+    assert pipe.est.n > 0  # clamped to LAG_MAX_S and evidence still flows
 
 
 class TestAdjustVerify:
@@ -613,12 +680,17 @@ class TestClosedLoopConvergence:
 
 
 def _frame(v, kc, km, pressed=False, rate=False, dev=False, saturated=False,
-           torque=0.0, a_ego=0.0, ws=None, low=1.0, high=1.0) -> Frame:
+           torque=0.0, a_ego=0.0, ws=None, low=1.0, high=1.0, lat_delay=0.2) -> Frame:
   """Test scaffolding: Frame with benign defaults (the production dataclass has none)."""
   return Frame(v_ego=v, kappa_cmd=kc, kappa_meas=km, steering_pressed=pressed,
                angle_rate_limited=rate, deviation_limited=dev, saturated=saturated,
                driver_torque=torque, a_ego=a_ego, ws_spread=ws,
-               low_factor=low, high_factor=high)
+               low_factor=low, high_factor=high, lateral_delay=lat_delay)
+
+
+# Alignment warmup at the default test delay (0.2 s): the pipeline needs this many frames
+# of command history before any steady evidence can exist.
+_LAG_F = int(round(0.2 / DT)) + 1
 
 
 class _MockParams:

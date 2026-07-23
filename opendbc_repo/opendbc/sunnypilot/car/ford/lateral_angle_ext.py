@@ -657,7 +657,8 @@ class LateralAngleExt:
               saturated=self.bp_angle_saturated,
               driver_torque=float(CS.out.steeringTorque), a_ego=float(CS.out.aEgo),
               ws_spread=max(ws_vals) - min(ws_vals),
-              low_factor=self.low_speed_curv_factor, high_factor=self.high_speed_curv_factor),
+              low_factor=self.low_speed_curv_factor, high_factor=self.high_speed_curv_factor,
+              lateral_delay=float(self.sm['liveDelay'].lateralDelay)),
         delay_estimated=str(self.sm['liveDelay'].status) == "estimated")
       if nudged is not None:
         self.low_speed_curv_factor = float(nudged[0])
