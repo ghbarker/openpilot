@@ -55,8 +55,9 @@ What it's doing underneath:
   the wheel (plus a cooldown after), and crowned/banked roads that push all the evidence
   to one side.
 - **Every adjustment is checked before the next one.** After a step, the calibrator
-  collects a fresh batch of clean curves *at the new value* and confirms the car's
-  response actually moved the way the step predicted. Confirmed → it keeps going.
+  collects a fresh batch of clean curves *at the new value* and confirms the step
+  actually brought the car **closer to doing exactly what's asked** (the measured
+  response strictly nearer 100% of requested than before). Confirmed → it keeps going.
   Contradicted → it stops moving that factor and demands twice the evidence before
   trying again. Poll a couple turns, adjust, poll some more — enforced, not hoped.
 - Evidence **survives ignition cycles** — progress is saved every 30 seconds and picked

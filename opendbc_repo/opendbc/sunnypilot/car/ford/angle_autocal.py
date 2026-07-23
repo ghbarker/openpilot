@@ -758,10 +758,15 @@ class AutoCalPipeline:
     return committed
 
   def _judge_verifies(self):
-    """Judge any pending step once enough FRESH post-step evidence exists. The response
-    ratio scales with the applied gain, so the step predicts its own direction; the fast
-    tracker (reset to zero when the step was taken) says whether the car agreed. Inside
-    VERIFY_OK_BAND of 1.0 is success outright — the step landed where it aimed."""
+    """Judge any pending step once enough FRESH post-step evidence exists (the fast
+    tracker was reset to zero when the step was taken, so it holds post-step data only).
+
+    The criterion is CLOSENESS, not direction: the response ratio tracks the applied
+    gain mechanically (drop the factor 2%, delivery drops ~2%, right or wrong), so
+    'did it move the predicted way' would confirm every step the actuator executed.
+    A step is only right if it brought the car closer to doing exactly what's asked:
+    |1 - ratio| strictly smaller than before the step, or inside VERIFY_OK_BAND of
+    1.0 outright — the step landed where calibration aims."""
     for half in (0, 1):
       pend = self.verify[half]
       if pend is None:
@@ -771,10 +776,9 @@ class AutoCalPipeline:
         continue  # keep polling — the window stays open until the data has spoken
       ok = abs(1.0 - r) <= VERIFY_OK_BAND
       if not ok and pend["pre_r"] is not None:
-        moved_up = pend["to"] > pend["frm"]
-        ok = (r > pend["pre_r"]) if moved_up else (r < pend["pre_r"])
+        ok = abs(1.0 - r) < abs(1.0 - pend["pre_r"])
       elif not ok:
-        ok = True  # no pre-step baseline to contradict (shouldn't happen in practice)
+        ok = True  # no pre-step baseline to compare against (shouldn't happen in practice)
       self.verify[half] = None
       if ok:
         self.verify_result[half] = "confirmed"
