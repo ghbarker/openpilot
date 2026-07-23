@@ -71,6 +71,7 @@ class BluePilotLayout(Widget):
       ("send_hands_free_cluster_msg", self._show_hands_free_ui),
       ("FordPrefSteerAngleCurvature", self._steer_angle_curvature),
       ("FordAngleAutoCal", self._angle_autocal),
+      ("FordAngleAutoCalLock", self._angle_autocal_lock),
       ("FordAngleSmoothing", self._angle_smoothing),
       ("BPDisableLaneLineStatusColor", self._disable_lane_line_status_color),
       ("BPHideCameraView", self._hide_camera_view),
@@ -537,6 +538,26 @@ class BluePilotLayout(Widget):
       callback=self._toggle_angle_autocal,
       icon="chffr_wheel.png"
     )
+    # BluePilot: lock behavior for the calibration above. Off = never freeze, keep
+    # adapting; flipping it off on a locked car resumes from the saved evidence.
+    self._angle_autocal_lock = toggle_item(
+      lambda: tr("Calibration Lock"),
+      lambda: tr("On (default): auto-calibration freezes once the factors have been stable for "
+                 "5 minutes of driving. Off: it never locks and keeps adapting continuously — "
+                 "turning this off on an already-locked car resumes calibration from its saved "
+                 "evidence without losing anything."),
+      initial_state=self._safe_get_bool(self._params, "FordAngleAutoCalLock", default=True),
+      callback=lambda state: self._toggle_callback(state, "FordAngleAutoCalLock"),
+      icon="chffr_wheel.png"
+    )
+    # BluePilot: full calibration do-over — evidence, error log and the factors themselves.
+    self._angle_autocal_erase = button_item(
+      lambda: tr("Erase Calibration Memory"),
+      lambda: tr("ERASE"),
+      lambda: tr("Wipes all collected calibration evidence, clears any lock, and puts both "
+                 "adjustment factors back to 1.00 for a clean retry. Works offroad or mid-drive."),
+      callback=self._erase_angle_autocal
+    )
     # BluePilot: anti-weave smoothing of the angle command path (gain-schedule filter,
     # wire-quantization hold, blend slew — see lateral_angle_ext.py _SM_* constants).
     self._angle_smoothing = toggle_item(
@@ -643,6 +664,8 @@ class BluePilotLayout(Widget):
       self._low_speed_curv_factor,
       self._high_speed_curv_factor,
       self._angle_autocal,
+      self._angle_autocal_lock,
+      self._angle_autocal_erase,
       self._angle_smoothing,
       self._angle_smoothing_strength,
       self._lane_change_factor_high_ang,
@@ -893,6 +916,8 @@ class BluePilotLayout(Widget):
     self._low_speed_curv_factor.action_item.set_enabled(is_angle)
     self._high_speed_curv_factor.action_item.set_enabled(is_angle)
     self._angle_autocal.action_item.set_enabled(is_angle)
+    self._angle_autocal_lock.action_item.set_enabled(is_angle)
+    self._angle_autocal_erase.action_item.set_enabled(is_angle)
     self._angle_smoothing.action_item.set_enabled(is_angle)
     self._angle_smoothing_strength.action_item.set_enabled(is_angle)
     self._lane_change_factor_high_ang.action_item.set_enabled(is_angle)
@@ -1047,6 +1072,19 @@ class BluePilotLayout(Widget):
         self._params.put("FordAngleAutoCalState", "")
       except UnknownKeyName:
         pass
+
+  def _erase_angle_autocal(self):
+    """Erase calibration memory: evidence, error log, any lock, and the factors back to
+    1.00. The params are cleared here for immediate offroad visibility; the onroad
+    controller consumes FordAngleAutoCalReset so a mid-drive erase lands within a second."""
+    try:
+      self._params.put_bool("FordAngleAutoCalReset", True)
+      self._params.put("FordAngleAutoCalState", "")
+      self._params.put("FordAngleAutoCalError", "")
+      self._params.put("FordLowSpeedFactor_ang", 1.0)
+      self._params.put("FordHighSpeedFactor_ang", 1.0)
+    except UnknownKeyName:
+      pass
 
   def _set_wheel_icon_style(self, button_index: int):
     """Handle wheel icon style: 0 = comma 4, 1 = comma 3X."""

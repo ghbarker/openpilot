@@ -663,6 +663,8 @@ class AutoCalPipeline:
     self.stable_s = 0.0
     self.nudges = 0
     self.locked = False
+    self.lock_enabled = True   # FordAngleAutoCalLock (set by the controller, not persisted):
+                               # False = never freeze, keep adapting for the life of the toggle
     # Adjust-then-verify state (persisted): each step opens a window that must be judged
     # against fresh evidence before its anchor may step again. half 0 = low, 1 = high.
     self.verify = {0: None, 1: None}     # {"frm": factor, "to": factor, "pre_r": ratio|None}
@@ -784,7 +786,7 @@ class AutoCalPipeline:
                and abs(low_t - frame.low_factor) <= LOCK_DEADBAND and abs(high_t - frame.high_factor) <= LOCK_DEADBAND)
       if ready:
         self.stable_s += self.dt
-        if self.stable_s >= LOCK_STABLE_S:
+        if self.stable_s >= LOCK_STABLE_S and self.lock_enabled:
           self.locked = True
       else:
         self.stable_s = 0.0

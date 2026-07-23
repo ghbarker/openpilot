@@ -110,6 +110,12 @@ When both factors have solid evidence behind them and the applied values have sa
 - The factors stop changing. Permanently, for this car.
 - The toggle stays on but does nothing further.
 
+**The lock is optional.** A **Calibration Lock** toggle sits next to the main switch
+(default on). Turn it off and the calibrator never freezes — it keeps adapting for as
+long as the main toggle is on. Turning the lock off on an *already locked* car resumes
+calibration from its saved evidence, losing nothing; turning it back on re-enables
+freezing once things are stable again.
+
 **To recalibrate** (new tires, alignment work, seasonal tire swap, or you just want a
 fresh pass): toggle it **off and back on**. That clears the evidence and starts a clean
 collection *from the current factor values*.

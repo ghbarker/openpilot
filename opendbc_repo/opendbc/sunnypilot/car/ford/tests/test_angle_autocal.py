@@ -571,6 +571,20 @@ class TestAdjustVerify:
     _feed_low(pipe, rec, VERIFY_FAIL_HOLD_WEIGHT + 4.0, 1.10, 1.10, ratio_scale=0.85)
     assert pipe.recommend(*rec) is not None
 
+  def test_lock_disabled_never_freezes(self):
+    # FordAngleAutoCalLock off: stability may accumulate forever, the pipeline must not
+    # lock — continuous adaptation for the life of the toggle. Lock-eligible evidence
+    # (weights past LOCK_MIN_WEIGHT, target == applied) is earned for real so the
+    # 'ready' predicate holds and only the lock_enabled check stands between
+    # stable_s and the freeze.
+    pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH)
+    feed_plant(pipe.est, 1.0, 1.0, speeds=[10, 28], n_per_speed=1400)
+    pipe.lock_enabled = False
+    pipe.stable_s = LOCK_STABLE_S - 0.1
+    _feed_low(pipe, (1.0, 1.0), 3.0, 1.0, 1.0)
+    assert not pipe.locked
+    assert pipe.stable_s > LOCK_STABLE_S  # kept counting straight past the threshold
+
   def test_verify_state_survives_serialization(self):
     pipe = _evidenced_pipe()
     rec = pipe.recommend(1.0, 1.0)
@@ -708,8 +722,13 @@ class _MockParams:
     "FordAngleAutoCalState": str,
     "FordAngleAutoCalError": str,
     "FordAngleAutoCalReset": bool,
+    "FordAngleAutoCalLock": bool,
     "lane_change_factor_high_ang": float,
   }
+
+  # Params whose declared default (params_keys.h) is true — the real get_bool returns
+  # the default for unwritten keys, so the mock must too.
+  _BOOL_DEFAULTS = {"FordAngleAutoCalLock": True}
 
   def __init__(self, values):
     self.values = values
@@ -719,6 +738,8 @@ class _MockParams:
     return self.values.get(key)
 
   def get_bool(self, key):
+    if key not in self.values:
+      return self._BOOL_DEFAULTS.get(key, False)
     return bool(self.values.get(key))
 
   def put(self, key, value):
@@ -843,6 +864,27 @@ class TestOnboardGlue:
     ext2.update_angle_params(p)
     assert ext2.autocal_ctl.pipeline is not None
     assert ext2.autocal_ctl.pipeline.est.solve() == sol
+
+  def test_lock_off_resumes_a_locked_calibration(self):
+    # A finished (locked) calibration + FordAngleAutoCalLock=0: the lock is treated as
+    # "resume from this evidence" — the controller arms, restores, and un-locks.
+    donor = AutoCalPipeline(PLATFORM_GAIN_HIGH)
+    feed_plant(donor.est, 1.05, 1.05, speeds=[10, 28], n_per_speed=200)
+    donor.locked = True
+    state = json.dumps({"v": 1, "phase": "locked", "pipe": donor.to_dict()})
+    ext = self._ext()
+    p = _MockParams({"FordAngleAutoCal": 1, "FordAngleAutoCalState": state,
+                     "FordAngleAutoCalLock": 0,
+                     "FordLowSpeedFactor_ang": "1.05", "FordHighSpeedFactor_ang": "1.05"})
+    ext.update_angle_params(p)
+    ctl = ext.autocal_ctl
+    assert ctl.enabled and ctl.pipeline is not None and not ctl.done
+    assert not ctl.pipeline.locked and not ctl.pipeline.lock_enabled
+    assert ctl.pipeline.est.n == donor.est.n  # evidence carried over, nothing lost
+    # Flipping the lock back ON mid-run re-enables freezing (but doesn't instantly lock).
+    p.values["FordAngleAutoCalLock"] = 1
+    self._tick(ext, p, n=1)
+    assert ctl.pipeline is not None and ctl.pipeline.lock_enabled and not ctl.pipeline.locked
 
   def test_reset_param_erases_everything(self):
     # The "erase calibration memory" button: evidence, error log, the LOCK, and the

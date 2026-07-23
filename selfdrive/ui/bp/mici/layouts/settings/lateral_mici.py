@@ -50,6 +50,11 @@ class LateralLayoutMici(NavScroller):
     # Full retry: wipes evidence AND puts both factors back to 1.00 (the toggle above
     # only clears the lock; it leaves the factors wherever the calibrator walked them).
     self.angle_autocal_erase = _EraseAutoCalButton()
+    # On (default): calibration freezes once stable. Off: never locks — keeps adapting;
+    # turning it off on an already-locked car resumes from the saved evidence.
+    self.angle_autocal_lock = BigParamControlBP(
+      "Calibration Lock", "FordAngleAutoCalLock",
+    )
     # Anti-weave smoothing of the angle command path (see lateral_angle_ext.py _SM_*).
     self.angle_smoothing = BigParamControlBP(
       "Smooth Steering (Anti-Weave)", "FordAngleSmoothing",
@@ -105,6 +110,7 @@ class LateralLayoutMici(NavScroller):
       self.low_speed_factor,
       self.high_speed_factor,
       self.angle_autocal,
+      self.angle_autocal_lock,
       self.angle_autocal_erase,
       self.angle_smoothing,
       self.angle_smoothing_strength,
@@ -126,6 +132,7 @@ class LateralLayoutMici(NavScroller):
 
     self._refresh_toggles = (
       ("FordAngleAutoCal", self.angle_autocal),
+      ("FordAngleAutoCalLock", self.angle_autocal_lock),
       ("FordAngleSmoothing", self.angle_smoothing),
       ("disable_BP_lat_UI", self.disable_BP_lat),
       ("BlinkerPauseLaneChange", self.disable_lane_change_under_speed),
@@ -157,6 +164,7 @@ class LateralLayoutMici(NavScroller):
     self.low_speed_factor.set_visible(is_angle)
     self.high_speed_factor.set_visible(is_angle)
     self.angle_autocal.set_visible(is_angle)
+    self.angle_autocal_lock.set_visible(is_angle)
     self.angle_autocal_erase.set_visible(is_angle)
     self.angle_smoothing.set_visible(is_angle)
     self.angle_smoothing_strength.set_visible(is_angle)

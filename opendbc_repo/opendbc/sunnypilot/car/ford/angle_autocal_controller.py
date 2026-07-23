@@ -88,12 +88,20 @@ class AutoCalController:
         self.status = "reset"
         return
       enabled = bool(params.get_bool("FordAngleAutoCal"))
+      # Lock behavior toggle (default ON): with the lock OFF the calibration never
+      # freezes — and an EXISTING lock is treated as "resume from this evidence", not
+      # as finished, so flipping the toggle un-locks without losing anything.
+      lock_on = bool(params.get_bool("FordAngleAutoCalLock"))
       state = params.get("FordAngleAutoCalState", return_default=True) or ""
       if isinstance(state, bytes):
         state = state.decode("utf-8", errors="replace")
       if self.pipeline is None:
-        self.done = _state_locked(state)
+        self.done = _state_locked(state) and lock_on
       else:
+        self.pipeline.lock_enabled = lock_on
+        if not lock_on and self.pipeline.locked:
+          self.pipeline.locked = False
+          self.pipeline.stable_s = 0.0
         self.done = self.pipeline.locked
       self.enabled = enabled and not self.done
       if self.enabled and self.pipeline is None:
@@ -101,6 +109,10 @@ class AutoCalController:
         # The currently applied factors are the nudge baseline.
         self.pipeline = AutoCalPipeline(platform_gain_high, dt=self.dt)
         _restore(self.pipeline, state)
+        self.pipeline.lock_enabled = lock_on
+        if not lock_on and self.pipeline.locked:
+          self.pipeline.locked = False  # resuming a previously locked calibration
+          self.pipeline.stable_s = 0.0
         self._last_written = (float(low_factor), float(high_factor))
         self._edit_pending = False
       elif not self.enabled:
