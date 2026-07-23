@@ -6,15 +6,19 @@ that is honestly too small for more than a gut feeling. This module gives the sa
 signals to any phone on the device's hotspot/LAN as a 20 Hz snapshot stream the
 portal serves over SSE.
 
-SAFETY-CRITICAL DESIGN CONSTRAINT (learned on-road 2026-07-22): the reader must
-register its message-queue subscriptions ONCE, at portal startup — never on first
-page view. msgq resets existing readers' queue state when a new reader joins, so a
-mid-drive SubMaster construction momentarily gaps carState/carControl for the very
-processes driving the car; that surfaced as a commIssue + silent disengage the
-moment the phone opened /lateral. The reader therefore starts with the portal
-process (offroad boot), holds CONFLATED sockets (only the newest message is kept
-and parsed, so the always-on cost is three tiny capnp parses per 50 ms tick), and
-never tears down. Watchers only gate whether samples are assembled.
+The reader starts on the first /lateral view, holds CONFLATED sockets (only the
+newest message is kept and parsed, so the running cost is three tiny capnp parses
+per 50 ms tick), and stays up for the life of the process. Watchers only gate
+whether samples are assembled.
+
+Note (2026-07-24): an earlier version of this file registered the reader at portal
+boot on the theory that a mid-drive SubMaster construction would gap carState for
+the driving processes and disengage the car. That was TESTED and disproven — a
+fresh msgq reader registering mid-stream does not disturb existing readers. The
+real /lateral disengage cause was CPU: spawning the whole bp_portal process at
+normal priority on a device already near 100% starved the driving stack. That is
+fixed by demoting the portal process to SCHED_IDLE at import (see bp_portal.py),
+so this feed can register whenever it likes without a boot pre-start.
 """
 
 import threading
