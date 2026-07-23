@@ -3887,6 +3887,21 @@ def main():
             server = ReuseAddressHTTPServer((bind_address, port), WebRoutesHandler)
             server.timeout = 30  # Set timeout to prevent hanging connections
             logger.info(f"Successfully bound to {bind_address}:{port}")
+            # The portal is a convenience service on a device whose cores run near their
+            # limit while driving (on-road profile 2026-07-23: max-core 91-98% during
+            # selfdrivedLagging/commIssue bursts). Demote the WHOLE process to the idle
+            # scheduling class so the kernel structurally cannot let it — or any of its
+            # request threads, which inherit the policy — preempt the driving processes.
+            # The page may stutter when the device is pegged; the car must not.
+            try:
+                os.sched_setscheduler(0, os.SCHED_IDLE, os.sched_param(0))
+                logger.info("portal demoted to SCHED_IDLE")
+            except (AttributeError, OSError, PermissionError) as e:
+                try:
+                    os.nice(19)
+                    logger.info(f"portal demoted via nice(19) (sched_idle unavailable: {e})")
+                except OSError:
+                    logger.warning("portal priority demotion failed — running at normal priority")
             # Register the lateral feed's message-queue readers NOW, at startup
             # (offroad). Registering lazily on the first /lateral page view gapped
             # carState for the driving processes (msgq resets existing readers when
