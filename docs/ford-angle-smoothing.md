@@ -92,6 +92,29 @@ the filters are built to pick up from the live steering state, never from stale 
 | Feels slow into curves | Not a smoothing effect at any strength (entry is fixed-fast) — check your speed-factor calibration instead. |
 | Wandering within the lane | Distinguish: the weave is *rhythmic* (a steady few-second cycle); random wander is usually crosswind, crown, or camera calibration. Smoothing targets the rhythm. |
 
+## If the straights still weave: the Small Signal Factor
+
+Smoothing removes steering *dither*; auto-calibration fixes *curve* delivery. There is a
+third mechanism, found by measurement on real drives (2026-07-23): on straight roads the
+car's power-steering computer delivers only **75–85% of the tiny corrections** it is
+asked for — and those tiny commands live below the range the calibrated factors cover.
+On a crowned or windy road the planner has to keep re-asking, overshooting, and
+re-asking: a slow ~6–7 second left-right weave between the lines that neither smoothing
+nor calibration can reach.
+
+**Small Signal Factor** (same menu) boosts only those tiny corrections:
+
+- **1.0 — stock**, bit-identical to the feature not existing.
+- **1.20–1.30** — matches the measured deficit; the recommended experiment range.
+- It applies **only at speed** (city driving unchanged) and **only below the curve
+  threshold** — your curve feel and the auto-calibrated factors are untouched, and it
+  cannot interact with auto-calibration at all.
+- Validated in the closed-loop simulator: restores the station-keeping the deficit
+  costs, with no instability anywhere in the sweep.
+
+Step it up one notch at a time on a road where you feel the straight-line weave; back
+off if the car ever feels darty on small corrections.
+
 ## Relationship to auto-calibration
 
 They're complementary and independent. Auto-calibration fixes the *average* correction

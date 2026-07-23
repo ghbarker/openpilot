@@ -62,6 +62,11 @@ class LateralLayoutMici(NavScroller):
     self.angle_smoothing_strength = BigParamFloatControl(
       "Smoothing Strength", "FordAngleSmoothStrength", min=1.0, max=2.5, step=0.1,
     )
+    # Sub-knee small-signal gain lift: compensates the PSCM's measured under-delivery of
+    # tiny corrections (the straights weave source). 1.0 = stock; measured deficit ~1.2-1.3.
+    self.small_signal_factor = BigParamFloatControl(
+      "Small Signal Factor", "FordSmallSignalFactor", min=0.8, max=1.5, step=0.05,
+    )
     self.lane_change_factor_high_ang = BigParamFloatControl(
       "Lane Change Factor High", "lane_change_factor_high_ang", min=0.85, max=1.50,
     )
@@ -114,6 +119,7 @@ class LateralLayoutMici(NavScroller):
       self.angle_autocal_erase,
       self.angle_smoothing,
       self.angle_smoothing_strength,
+      self.small_signal_factor,
       self.lane_change_factor_high_ang,
       self.disable_lane_change_under_speed,
       self.blinker_min_speed,
@@ -168,6 +174,7 @@ class LateralLayoutMici(NavScroller):
     self.angle_autocal_erase.set_visible(is_angle)
     self.angle_smoothing.set_visible(is_angle)
     self.angle_smoothing_strength.set_visible(is_angle)
+    self.small_signal_factor.set_visible(is_angle)
     self.lane_change_factor_high_ang.set_visible(is_angle)
     self.blinker_min_speed.set_enabled(ui_state.params.get_bool("BlinkerPauseLaneChange"))
     for item in (
