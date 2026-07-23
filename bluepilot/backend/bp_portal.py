@@ -3887,6 +3887,15 @@ def main():
             server = ReuseAddressHTTPServer((bind_address, port), WebRoutesHandler)
             server.timeout = 30  # Set timeout to prevent hanging connections
             logger.info(f"Successfully bound to {bind_address}:{port}")
+            # Register the lateral feed's message-queue readers NOW, at startup
+            # (offroad). Registering lazily on the first /lateral page view gapped
+            # carState for the driving processes (msgq resets existing readers when
+            # one joins) and disengaged the car on-road — see lateral_stream.py.
+            try:
+                from bluepilot.backend.realtime.lateral_stream import LateralFeed
+                LateralFeed.instance().ensure_started()
+            except Exception as e:
+                logger.warning(f"lateral feed pre-start skipped: {e}")
             break
         except OSError as e:
             if e.errno == 98:  # Address already in use

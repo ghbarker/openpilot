@@ -6,10 +6,15 @@ that is honestly too small for more than a gut feeling. This module gives the sa
 signals to any phone on the device's hotspot/LAN as a 20 Hz snapshot stream the
 portal serves over SSE.
 
-Design mirrors realtime/log_streamer.py: messaging is imported lazily (the portal
-must keep working on hosts without cereal), a single background reader thread owns
-the SubMaster, and it starts on the first subscriber and stops after a short idle
-so the portal costs nothing while nobody is watching.
+SAFETY-CRITICAL DESIGN CONSTRAINT (learned on-road 2026-07-22): the reader must
+register its message-queue subscriptions ONCE, at portal startup — never on first
+page view. msgq resets existing readers' queue state when a new reader joins, so a
+mid-drive SubMaster construction momentarily gaps carState/carControl for the very
+processes driving the car; that surfaced as a commIssue + silent disengage the
+moment the phone opened /lateral. The reader therefore starts with the portal
+process (offroad boot), holds CONFLATED sockets (only the newest message is kept
+and parsed, so the always-on cost is three tiny capnp parses per 50 ms tick), and
+never tears down. Watchers only gate whether samples are assembled.
 """
 
 import threading
@@ -19,7 +24,6 @@ import logging
 logger = logging.getLogger(__name__)
 
 _RATE_HZ = 20.0
-_IDLE_STOP_S = 10.0     # reader stops this long after the last subscriber detaches
 
 
 class LateralFeed:
@@ -38,25 +42,29 @@ class LateralFeed:
     def __init__(self):
         self._lock = threading.Lock()
         self._thread = None
-        self._subscribers = 0
-        self._last_sub_gone = 0.0
+        self._watchers = 0
         self._seq = 0
         self._sample = {}
 
-    # -- subscriber lifecycle -------------------------------------------------------------
-    def attach(self):
+    # -- lifecycle --------------------------------------------------------------------------
+    def ensure_started(self):
+        """Start the permanent reader. Called once at portal startup so the message-queue
+        reader registration happens offroad — NEVER lazily from a request handler (see the
+        module docstring for why that disengaged the car)."""
         with self._lock:
-            self._subscribers += 1
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(target=self._run, daemon=True,
                                                 name="lateral_feed")
                 self._thread.start()
 
+    def attach(self):
+        self.ensure_started()  # belt and suspenders; the registration cost was paid at boot
+        with self._lock:
+            self._watchers += 1
+
     def detach(self):
         with self._lock:
-            self._subscribers = max(0, self._subscribers - 1)
-            if self._subscribers == 0:
-                self._last_sub_gone = time.monotonic()
+            self._watchers = max(0, self._watchers - 1)
 
     def snapshot(self, last_seq: int):
         """(seq, sample) if newer than last_seq else (last_seq, None)."""
@@ -66,11 +74,6 @@ class LateralFeed:
             return self._seq, dict(self._sample)
 
     # -- reader ---------------------------------------------------------------------------
-    def _should_stop(self) -> bool:
-        with self._lock:
-            return (self._subscribers == 0
-                    and time.monotonic() - self._last_sub_gone > _IDLE_STOP_S)
-
     def _run(self):
         try:
             import cereal.messaging as messaging
@@ -78,41 +81,56 @@ class LateralFeed:
             logger.error("lateral feed: messaging unavailable: %s", exc)
             return
         try:
-            sm = messaging.SubMaster(['carState', 'carControl', 'controllerStateBP'])
+            # Conflated: the queue keeps only the newest message, so the permanent reader
+            # parses at most one message per service per tick regardless of publish rate.
+            socks = {name: messaging.sub_sock(name, conflate=True, timeout=0)
+                     for name in ("carState", "carControl", "controllerStateBP")}
         except Exception as exc:
-            logger.error("lateral feed: SubMaster failed: %s", exc)
+            logger.error("lateral feed: sub_sock failed: %s", exc)
             return
-        logger.info("lateral feed: reader started")
+        logger.info("lateral feed: permanent reader started (registered at boot)")
+        latest = {}
+        last_seen = {name: 0.0 for name in socks}
         period = 1.0 / _RATE_HZ
-        while not self._should_stop():
+        while True:
             t0 = time.monotonic()
             try:
-                sm.update(int(period * 1000))
-                cs = sm['carState']
-                cc = sm['carControl']
-                st = sm['controllerStateBP']
-                sample = {
-                    't': time.time(),
-                    'desired_deg': float(cc.actuators.steeringAngleDeg),
-                    'actual_deg': float(cs.steeringAngleDeg),
-                    'v_mph': float(cs.vEgo) * 2.23694,
-                    'lat_active': bool(cc.latActive),
-                    'torque_nm': float(cs.steeringTorque),
-                    'low_factor': float(st.bmsLowSpeedAdjustmentFactor),
-                    'high_factor': float(st.bmsHighSpeedAdjustmentFactor),
-                    'autocal': str(st.bmsAngleAutoCalState),
-                    'alive': bool(sm.alive['carState'] and sm.alive['carControl']),
-                }
+                for name, sock in socks.items():
+                    msg = messaging.recv_one_or_none(sock)
+                    if msg is not None:
+                        latest[name] = msg
+                        last_seen[name] = t0
                 with self._lock:
-                    self._sample = sample
-                    self._seq += 1
+                    watching = self._watchers > 0
+                if watching and "carState" in latest and "carControl" in latest:
+                    cs = latest["carState"].carState
+                    cc = latest["carControl"].carControl
+                    st = latest.get("controllerStateBP")
+                    stb = st.controllerStateBP if st is not None else None
+                    fresh = (t0 - last_seen["carState"] < 1.0
+                             and t0 - last_seen["carControl"] < 1.0)
+                    sample = {
+                        't': time.time(),
+                        'desired_deg': float(cc.actuators.steeringAngleDeg),
+                        'actual_deg': float(cs.steeringAngleDeg),
+                        'v_mph': float(cs.vEgo) * 2.23694,
+                        'lat_active': bool(cc.latActive),
+                        'torque_nm': float(cs.steeringTorque),
+                        'low_factor': float(stb.bmsLowSpeedAdjustmentFactor) if stb is not None else 0.0,
+                        'high_factor': float(stb.bmsHighSpeedAdjustmentFactor) if stb is not None else 0.0,
+                        'autocal': str(getattr(stb, 'bmsAngleAutoCalState', '')) if stb is not None else '',
+                        'alive': fresh,
+                    }
+                    if fresh:
+                        with self._lock:
+                            self._sample = sample
+                            self._seq += 1
             except Exception as exc:
                 # keep the reader alive through transient messaging hiccups
                 logger.debug("lateral feed: update error: %s", exc)
             dt = time.monotonic() - t0
             if dt < period:
                 time.sleep(period - dt)
-        logger.info("lateral feed: reader stopped (idle)")
 
 
 def serve_sse(handler):
