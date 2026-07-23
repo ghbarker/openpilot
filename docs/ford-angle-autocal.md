@@ -56,6 +56,10 @@ What it's doing underneath:
   surfaces, hard braking/accelerating, tire-limit cornering, any moment your hands are on
   the wheel (plus a cooldown after), and crowned/banked roads that push all the evidence
   to one side.
+- **Only calm data counts.** Evidence is taken solely while the steering loop is quietly
+  tracking — the moments when the car is swinging wide or catching itself back are the
+  loop's dynamics, not the car's gain, and they are refused outright. A step takes as
+  many curve passes as calm data requires; a slower right answer beats a faster wrong one.
 - **Every adjustment is checked before the next one.** After a step, the calibrator
   collects a fresh batch of clean curves *at the new value* and confirms the step
   actually brought the car **closer to doing exactly what's asked** (the measured

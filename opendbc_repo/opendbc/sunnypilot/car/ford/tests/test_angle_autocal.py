@@ -527,6 +527,33 @@ class TestLagAlignment:
     assert pipe.est.n > 0  # clamped to LAG_MAX_S and evidence still flows
 
 
+class TestQuietGate:
+  """Loop hunting must never become gain evidence — the user's criterion, 2026-07-23:
+  taking 1-4 passes per step is fine; moving the needle on mid-dynamics data is not."""
+
+  def test_hunting_yields_almost_no_evidence(self):
+    # Same duration, same command: a calm constant-deficit plant vs a hunting plant
+    # whose error swings on a ~3s loop cycle (all swings INSIDE the rate bounds that
+    # used to admit them). The hunting run must yield a small fraction of the weight.
+    quiet = AutoCalPipeline(PLATFORM_GAIN_HIGH)
+    hunt = AutoCalPipeline(PLATFORM_GAIN_HIGH)
+    for i in range(1200):
+      quiet.update(_frame(10.0, 0.003, 0.003 * 0.90))
+      swing = 0.0006 * math.sin(2 * math.pi * i * DT / 3.0)
+      hunt.update(_frame(10.0, 0.003, 0.003 * 0.90 + swing))
+    assert quiet.est.s_w > 0
+    assert hunt.est.s_w < 0.35 * quiet.est.s_w, (hunt.est.s_w, quiet.est.s_w)
+
+  def test_constant_deficit_is_calm_and_admitted(self):
+    # A steady plant deficit keeps a FLAT error trend: exactly the signal we want,
+    # and the quiet gate must not confuse it with dynamics.
+    pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH)
+    _feed_low(pipe, (1.0, 1.0), 10.0, 1.10, 1.10)
+    assert pipe.est.s_w > 0
+    _w, r = pipe.est.recent_response(0)
+    assert r is not None and abs(r - 1.0 / 1.10) < 0.01
+
+
 class TestAdjustVerify:
   """Every step is judged against FRESH post-step evidence before its anchor may step
   again — the no-cap regime's runaway protection ('poll a couple turns, adjust, poll

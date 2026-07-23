@@ -73,6 +73,15 @@ MIN_KAPPA = 0.001           # 1/m; fully inside the high-curvature branch the fa
 # vs the old frozen-command gate this recovers 3-5x the evidence on winding roads with
 # the pooled fit unchanged (high 1.127 before and after, stderr 0.033 -> 0.012).
 LAG_MIN_S, LAG_MAX_S = 0.10, 0.42  # trust clamp for the liveDelay estimate
+# --- Loop-quietness admission ------------------------------------------------------------
+# Steady evidence is taken only while the tracking loop is CALM: the smoothed
+# |meas - aligned cmd| error trend must be flat. Samples taken mid-excursion or
+# mid-correction carry the LOOP's dynamics, not the plant's gain — audited on-road
+# 2026-07-23: 39% of admissions were non-quiet and read up to 3% low, biasing the fit
+# ~+0.01 high ("moving the needle and calling it done"). Convergence may take as many
+# passes as calm data requires; a slower right answer beats a faster wrong one.
+QUIET_TAU_S = 0.4           # smoothing of |tracking error| before its trend is judged
+QUIET_ERR_RATE = 0.0002     # 1/m/s: |d|err|/dt| above this = loop dynamics, no evidence
 MAX_KAPPA_RATE = 0.0015     # 1/m/s absolute floor of the admission rate bound
 REL_KAPPA_RATE = 0.5        # 1/s: |dk/dt| may reach this fraction of |k| (winding roads)
 STEADY_TIME_S = 0.3         # command steady this long before samples count (PSCM settle)
@@ -653,6 +662,7 @@ class AutoCalPipeline:
     self.dt = dt
     self._staged: list[list] = []  # [age_s, v, kappa_cmd, kappa_meas, applied_gain, weight]
     self._meas_last = None
+    self._err_lp = None            # smoothed |tracking error| for the quietness gate
     self._decay_accum = 0.0
     # Lag alignment: ring of recent (kappa_cmd, applied_gain) so this frame's measurement
     # can be ratioed against the command (and the gain in force) when it was ISSUED.
@@ -683,6 +693,7 @@ class AutoCalPipeline:
     self.peaks.clear()
     self._staged.clear()
     self._meas_last = None
+    self._err_lp = None
     self._hist.clear()  # commands across a discontinuity must never be an alignment target
 
   def update(self, frame: Frame) -> list:
@@ -738,6 +749,21 @@ class AutoCalPipeline:
       eligible = (abs(kappa_meas - self._meas_last) / self.dt
                   <= 3.0 * max(MAX_KAPPA_RATE, REL_KAPPA_RATE * abs(kappa_ref)))
     self._meas_last = kappa_meas
+
+    # Loop-quietness: only calm-tracking frames are gain evidence (see QUIET_* constants).
+    # A constant plant deficit keeps a FLAT error trend and passes; an excursion or the
+    # correction that follows it moves the trend and is refused — the loop's hunting can
+    # never masquerade as gain information, however long that makes a step take.
+    if aligned:
+      err_now = abs(kappa_meas - kappa_ref)
+      if self._err_lp is None:
+        self._err_lp = err_now
+        eligible = False  # no trend established yet
+      else:
+        prev = self._err_lp
+        self._err_lp += (self.dt / (QUIET_TAU_S + self.dt)) * (err_now - self._err_lp)
+        if abs(self._err_lp - prev) / self.dt > QUIET_ERR_RATE:
+          eligible = False
 
     # Evidence near the physical limit fades to nothing: there, cmd != meas is physics.
     lat_accel = abs(kappa_cmd) * v_ego * v_ego
