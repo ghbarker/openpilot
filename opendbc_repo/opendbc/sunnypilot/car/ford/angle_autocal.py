@@ -163,8 +163,14 @@ LR_MIN_WEIGHT = 5.0         # per-direction weight before the divergence check m
 NUDGE_PERIOD_S = 20.0       # at most one nudge per this much active collection
 NUDGE_MIN_WEIGHT = 10.0     # anchor evidence before it may move its factor
 NUDGE_MAX_STDERR = 0.06     # effective stderr must be at least this good
-NUDGE_DEADBAND = 0.015      # |target - applied| below this: leave it alone
-NUDGE_STEP = 0.02           # max factor change per nudge (menu granularity is 0.01)
+# Damped-proportional step: move a fraction of the remaining error toward the fit, quantized
+# to the 0.01 menu step and capped. Big steps when far (fast convergence), single 0.01 steps
+# near the target, and — because the target is invariant to the applied factor — it glides in
+# without overshooting instead of crawling a fixed 0.02 or jumping past and reversing.
+FACTOR_STEP = 0.01          # menu granularity (factors are 2-decimal)
+NUDGE_GAIN = 0.7            # fraction of the remaining error per nudge (< 1 damps overshoot)
+NUDGE_MAX_STEP = 0.05       # max factor change per nudge
+_NUDGE_MAX_UNITS = round(NUDGE_MAX_STEP / FACTOR_STEP)  # = 5
 
 # --- Adjust-then-verify ------------------------------------------------------------------
 # 2026-07-22 design decision: the per-drive movement caps (0.10 high / 0.04 low) are GONE —
@@ -216,6 +222,14 @@ def fit_trustworthy(weight: float, stderr_eff: float, min_weight: float) -> bool
   weight bar and in what they do with |target - applied| afterwards. A new eligibility
   condition (e.g. a sensor-health gate) is added here once."""
   return weight >= min_weight and stderr_eff <= NUDGE_MAX_STDERR
+
+
+def nudge_units(err: float) -> int:
+  """Damped, menu-quantized nudge size in whole FACTOR_STEP units, capped. Returns 0 inside
+  the (implicit) deadband — |NUDGE_GAIN * err| below half a step. Shared by the stepper and
+  the live status so 'would nudge' is defined in one place."""
+  n = round(NUDGE_GAIN * err / FACTOR_STEP)
+  return max(-_NUDGE_MAX_UNITS, min(_NUDGE_MAX_UNITS, n))
 
 
 class AngleFactorEstimator:
@@ -904,12 +918,11 @@ class AutoCalPipeline:
         if w_rec < self.verify_hold[half]:
           return None  # a failed check demands extra evidence before moving again
         self.verify_hold[half] = 0.0
-      err = target - applied
-      if abs(err) <= NUDGE_DEADBAND:
+      units = nudge_units(target - applied)
+      if units == 0:
         return None
-      s = max(-NUDGE_STEP, min(NUDGE_STEP, err))
-      new = round(max(FACTOR_MIN, min(FACTOR_MAX, applied + s)), 2)
-      return new if abs(new - applied) >= 0.005 else None
+      new = round(max(FACTOR_MIN, min(FACTOR_MAX, applied + units * FACTOR_STEP)), 2)
+      return new if new != round(applied, 2) else None
 
     new_low = step(0, low_t, low_factor, st["weight_low"], st["stderr_eff_low"])
     new_high = step(1, high_t, high_factor, st["weight_high"], st["stderr_eff_high"])
@@ -969,7 +982,7 @@ class AutoCalPipeline:
         d["vneed"] = VERIFY_MIN_WEIGHT
       elif (target is not None and stderr is not None
             and fit_trustworthy(weight, stderr, NUDGE_MIN_WEIGHT)):
-        if abs(target - applied) > NUDGE_DEADBAND:
+        if nudge_units(target - applied) != 0:
           d["ph"] = "propose"
           d["t"] = round(target, 2)
         else:

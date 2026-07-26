@@ -13,7 +13,7 @@ from opendbc.sunnypilot.car.ford.angle_autocal import (
   PEAK_MIN_KAPPA, PEAK_PROMINENCE, PEAK_MEDIAN_N, PEAK_WEIGHT_S,
   SPIKE_MEAS_RATE, DISTURBANCE_BLANK_S, ROUGH_RMS_MAX, WS_SPREAD_JUMP,
   TAU_EVIDENCE_S, LR_MIN_WEIGHT, LR_TOL,
-  NUDGE_PERIOD_S, NUDGE_MIN_WEIGHT, NUDGE_DEADBAND, NUDGE_STEP,
+  NUDGE_PERIOD_S, NUDGE_MIN_WEIGHT, NUDGE_MAX_STEP, FACTOR_STEP, nudge_units,
   VERIFY_MIN_WEIGHT, VERIFY_FAIL_HOLD_WEIGHT,
   LOCK_MIN_WEIGHT, LOCK_DEADBAND, LOCK_STABLE_S,
 )
@@ -419,16 +419,33 @@ class TestFactorNudger:
     return _evidenced_pipe(**kw)
 
   def test_nudges_toward_target_bounded(self):
+    # err 0.10, damped by NUDGE_GAIN then capped: a big-but-bounded step, not the whole error.
     pipe = self._evidenced_pipe(true_low=1.10, true_high=1.10)
     rec = pipe.recommend(1.0, 1.0)
     assert rec is not None
     low, high = rec
-    assert low == round(1.0 + NUDGE_STEP, 2)   # full step, not the whole error
-    assert high == round(1.0 + NUDGE_STEP, 2)
+    assert low == round(1.0 + NUDGE_MAX_STEP, 2)
+    assert high == round(1.0 + NUDGE_MAX_STEP, 2)
+
+  def test_single_step_when_close(self):
+    # A target ~0.01 away moves by exactly one menu step (the point of damped stepping).
+    pipe = self._evidenced_pipe(true_low=1.01, true_high=1.01)
+    rec = pipe.recommend(1.0, 1.0)
+    assert rec is not None
+    assert rec[0] == round(1.0 + FACTOR_STEP, 2) and rec[1] == round(1.0 + FACTOR_STEP, 2)
 
   def test_deadband_no_nudge(self):
-    pipe = self._evidenced_pipe(true_low=1.01, true_high=1.01)
-    assert pipe.recommend(1.0, 1.0) is None  # |err| ~ 0.01 < deadband
+    # Inside the implicit deadband (|gain*err| < half a step): leave it alone.
+    pipe = self._evidenced_pipe(true_low=1.004, true_high=1.004)
+    assert pipe.recommend(1.0, 1.0) is None
+
+  def test_nudge_units_damped_and_capped(self):
+    cap = round(NUDGE_MAX_STEP / FACTOR_STEP)
+    assert nudge_units(0.0) == 0
+    assert nudge_units(0.004) == 0          # implicit deadband
+    assert nudge_units(0.01) == 1           # single menu step when close
+    assert nudge_units(0.10) == cap         # far: damped then capped
+    assert nudge_units(-0.10) == -cap       # symmetric
 
   def test_rate_limited(self):
     pipe = self._evidenced_pipe()
@@ -717,7 +734,7 @@ class TestClosedLoopConvergence:
     assert pipe.locked, (applied, pipe.stable_s, pipe.est.weight_low, pipe.est.weight_high)
     # No oscillation: once inside the deadband the nudger must not bounce in and out.
     lows = [r[0] for r in all_nudges]
-    assert all(l2 >= l1 - NUDGE_STEP - 1e-9 for l1, l2 in zip(lows, lows[1:])), lows
+    assert all(l2 >= l1 - NUDGE_MAX_STEP - 1e-9 for l1, l2 in zip(lows, lows[1:])), lows
 
 
 def _frame(v, kc, km, pressed=False, rate=False, dev=False, saturated=False,
