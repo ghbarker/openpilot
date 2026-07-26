@@ -15,27 +15,6 @@ All utility functions have been modularized into dedicated modules.
 """
 
 import os
-
-# BluePilot: demote the ENTIRE portal process to the idle scheduling class BEFORE the heavy
-# import tree (requests, asyncio, and the whole bluepilot.backend.* subsystem) loads. The
-# device runs its cores near 100% while driving; spawning this process at normal priority
-# spiked CPU and starved modeld/controlsd into commIssue/selfdrivedLagging -> disengage.
-# That was the real /lateral disengage cause (2026-07-24) — msgq reader registration was
-# tested and proven harmless, and the earlier in-main() demotion ran far too late (the
-# launcher imports this module, at normal priority, before main()). At SCHED_IDLE the
-# kernel runs the portal only when no driving process wants the CPU: on a pegged device the
-# page comes up slowly, but the portal can never preempt the car. Gated on the daemon
-# marker so a plain `import bp_portal` (tests, tooling) never demotes an unrelated process;
-# falls back to nice(19) where SCHED_IDLE is unavailable (non-Linux/dev hosts).
-if os.environ.get("MANAGER_DAEMON") == "bp_portal":
-  try:
-    os.sched_setscheduler(0, os.SCHED_IDLE, os.sched_param(0))
-  except (AttributeError, OSError, PermissionError):
-    try:
-      os.nice(19)
-    except OSError:
-      pass
-
 import json
 import mimetypes
 import subprocess
@@ -900,7 +879,6 @@ class WebRoutesHandler(BaseHTTPRequestHandler):
                     '/api/logs',
                     '/api/manager-logs',
                     '/api/websocket_status',
-                    '/api/lateral',
                     '/api/drive-stats',
                     '/api/panels',
                 ]
@@ -923,16 +901,6 @@ class WebRoutesHandler(BaseHTTPRequestHandler):
             # Route handlers
             if path in SPA_ROUTES or path.startswith('/settings/'):
                 self.send_file_response(str(WEBAPP_DIR / 'index.html'), 'text/html')
-                return
-
-            # Live lateral debug graph for phones (self-contained page, works onroad —
-            # that is its purpose; see realtime/lateral_stream.py)
-            if path == '/lateral':
-                self.send_file_response(str(WEBAPP_DIR / 'lateral.html'), 'text/html')
-                return
-            if path == '/api/lateral/stream':
-                from bluepilot.backend.realtime.lateral_stream import serve_sse
-                serve_sse(self)
                 return
 
             # API routes - separate if/elif chain since SPA routes return early
@@ -3908,13 +3876,6 @@ def main():
             server = ReuseAddressHTTPServer((bind_address, port), WebRoutesHandler)
             server.timeout = 30  # Set timeout to prevent hanging connections
             logger.info(f"Successfully bound to {bind_address}:{port}")
-            # Priority: the whole process was demoted to SCHED_IDLE at module import
-            # (before the heavy import tree) — see the top of this file. Request threads
-            # inherit the policy, so no request can preempt the driving stack.
-            # The lateral feed's message-queue readers register on first view; a
-            # mid-drive registration was verified NOT to disturb existing readers
-            # (2026-07-24), so no boot pre-start is needed — the SCHED_IDLE spawn is
-            # what the disengage fix actually required.
             break
         except OSError as e:
             if e.errno == 98:  # Address already in use

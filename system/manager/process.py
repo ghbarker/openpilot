@@ -19,12 +19,6 @@ from openpilot.common.swaglog import cloudlog
 
 def launcher(proc: str, name: str) -> None:
   try:
-    # Mark this as the launched daemon BEFORE importing the process module, so a module
-    # can tell it is running as its own daemon (vs. being imported for a symbol) and act
-    # on it during its own import — e.g. bp_portal demotes itself to SCHED_IDLE here so its
-    # heavy import tree never preempts the driving stack. Parity with nativelauncher.
-    os.environ['MANAGER_DAEMON'] = name
-
     # import the process
     mod = importlib.import_module(proc)
 
