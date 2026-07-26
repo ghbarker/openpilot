@@ -66,8 +66,8 @@ class LateralDebugMici(Widget):
       ]
     )
     self._last_push_time = 0.0
-    # Auto-cal battery gauges (blue = low band, red = high band), a postage-stamp mirror
-    # of the phone dashboard in the strip left of the plot. Hidden when auto-cal is off.
+    # Auto-cal band gauges (blue = low band, red = high band); on-device mirror of the
+    # phone dashboard, hidden when auto-cal is off.
     self._cal_bars = AutoCalBars()
     self._last_cal_poll = 0.0
 
@@ -115,8 +115,7 @@ class LateralDebugMici(Widget):
     # The legend is lifted via legend_y_offset so it doesn't overlap "tap to close" below.
     self._graph.render(rect)
 
-    # Auto-cal battery gauges (blue = low band, red = high band) in the free strip
-    # between the y-axis scale labels and the plot; drawn only while armed.
+    # Gauges sit in the strip between the y-axis labels and the plot; armed-only.
     if self._cal_bars.active:
       self._cal_bars.render(rl.Rectangle(rect.x + 52, rect.y + 36,
                                          AutoCalBars.WIDTH, AutoCalBars.HEIGHT))

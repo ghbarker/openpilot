@@ -1,23 +1,13 @@
 """Auto-calibration band gauges for the on-device lateral debug graph.
 
 Two phone-battery-style vertical gauges — BLUE = low band (curves under 30 mph),
-RED = high band (over 60 mph) — in the free strip between the y-axis scale labels
-and the plot. Fill rises bottom-up:
-  collecting  -> evidence progress toward acting (dim fill)
-  checking    -> fresh-evidence progress of the verify window (bright)
-  measuring   -> response as a fraction of 110%, with a thin tick marking exactly
-                 100%-of-requested (fill at the tick = calibrated)
-  locked      -> full
-Hidden entirely while auto-calibration is off.
+RED = high band (over 60 mph) — in the strip left of the plot. Each fills bottom-up as
+that band charges toward calibrated: partway while collecting evidence, up while a step
+is being checked, and full once the band is calibrated. A full band stays full; when the
+whole calibration locks the gauges become padlocks. Hidden while auto-calibration is off.
 
-Cost discipline (the UI process runs ~75% of a core on the MICI): the status string
-is parsed only when it CHANGES (~1 Hz publisher cadence), the socket is conflated so
-one message is parsed per poll regardless of the 100 Hz publish rate, and the render
-is a few rectangles per gauge.
-
-The status socket is created at MODULE IMPORT (UI process boot) — never lazily when
-the screen first opens, which would register a new message-queue reader mid-drive
-(the /lateral lesson, 2026-07-23: readers register at boot, full stop).
+Status is parsed only when it changes (~1 Hz), off a conflated socket, so the widget is a
+handful of rectangles per frame — cheap on the UI process.
 """
 import json
 
@@ -29,7 +19,7 @@ from openpilot.system.ui.lib.application import gui_app, FontWeight
 try:
   import cereal.messaging as _messaging
   _STATUS_SOCK = _messaging.sub_sock("controllerStateBP", conflate=True, timeout=0)
-except Exception:  # PC/dev hosts without cereal sockets: gauges simply stay hidden
+except Exception:  # PC/dev hosts without cereal sockets: gauges stay hidden
   _messaging = None
   _STATUS_SOCK = None
 
@@ -40,7 +30,12 @@ _NUB_W, _NUB_H = 10, 4
 _LABEL_GAP = 4
 _LABEL_FONT = 12
 _ROW_PITCH = _NUB_H + _BATT_H + _LABEL_GAP + _LABEL_FONT + 10
-_RESP_SPAN = 1.1  # response fill spans 0..110% of requested; the tick marks 100%
+
+# Fill is a single monotonic "progress toward calibrated" so the battery never fills then
+# un-fills as the anchor moves between phases. Evidence alone tops out below full; only a
+# calibrated band reads full (and latches there — see _fill's hysteresis).
+_COLLECT_TOP = 0.7   # evidence progress maps into [0, _COLLECT_TOP]
+_VERIFY_TOP = 0.9    # a step being checked maps into [_COLLECT_TOP, _VERIFY_TOP]
 
 
 def poll_status() -> str | None:
@@ -53,6 +48,29 @@ def poll_status() -> str | None:
   return str(msg.controllerStateBP.bmsAngleAutoCalState)
 
 
+def band_fill(band_st: dict, was_full: bool) -> tuple[float, bool]:
+  """Monotonic 'progress toward calibrated' fill (0..1) for one band, plus the new
+  latched-full state. Pure, so it is unit-tested directly. 'good' latches full and stays
+  full through borderline good/propose flicker; a fresh 'verify' step or a 'collect' reset
+  drops it. Evidence alone (collect) tops out below full — the fill-then-un-fill bug was
+  showing three different metrics per phase; this is one."""
+  ph = band_st.get("ph", "collect")
+  full = was_full
+  if ph == "good":
+    full = True
+  elif ph in ("verify", "collect"):
+    full = False
+  if full:
+    return 1.0, full
+  if ph == "verify":
+    need = max(float(band_st.get("vneed", 6)), 1e-6)
+    return _COLLECT_TOP + (_VERIFY_TOP - _COLLECT_TOP) * min(1.0, float(band_st.get("vw", 0.0)) / need), full
+  if ph == "propose":
+    return _COLLECT_TOP, full
+  need = max(float(band_st.get("need", 10)), 1e-6)  # collect
+  return _COLLECT_TOP * min(1.0, float(band_st.get("w", 0.0)) / need), full
+
+
 class AutoCalBars(Widget):
   """Hidden whenever auto-calibration is off / status is not renderable."""
 
@@ -62,7 +80,8 @@ class AutoCalBars(Widget):
   def __init__(self):
     super().__init__()
     self._raw = None
-    self._st = None   # dict (armed JSON) | "locked" | None
+    self._st = None                        # dict (armed JSON) | "locked" | None
+    self._full = {"low": False, "high": False}  # latched-full state per band (hysteresis)
 
   def update_status(self, status: str | None):
     if status is None or status == self._raw:
@@ -83,21 +102,35 @@ class AutoCalBars(Widget):
   def active(self) -> bool:
     return self._st is not None
 
-  def _gauge(self, band: str):
-    """(fill 0..1, tick 0..1 or None, bright) for one band."""
-    if self._st == "locked":
-      return 1.0, None, True
-    b = self._st.get(band, {})
-    ph = b.get("ph", "collect")
-    if ph == "collect":
-      need = max(float(b.get("need", 10)), 1e-6)
-      return min(1.0, float(b.get("w", 0.0)) / need), None, False
-    if ph == "verify":
-      need = max(float(b.get("vneed", 6)), 1e-6)
-      return min(1.0, float(b.get("vw", 0.0)) / need), None, True
-    r = b.get("r")  # propose / good: response fill with the 100% tick
-    fill = (min(_RESP_SPAN, max(0.0, float(r))) / _RESP_SPAN) if r is not None else 0.0
-    return fill, 1.0 / _RESP_SPAN, True
+  @property
+  def locked(self) -> bool:
+    return self._st == "locked"
+
+  def _fill(self, band: str) -> float:
+    fill, self._full[band] = band_fill(self._st.get(band, {}), self._full[band])
+    return fill
+
+  def _draw_battery(self, x: int, y: int, fill: float, rgb):
+    col = rl.Color(rgb[0], rgb[1], rgb[2], 235)
+    body_y = int(y + _NUB_H)
+    rl.draw_rectangle(x + (_BATT_W - _NUB_W) // 2, int(y), _NUB_W, _NUB_H, rl.Color(150, 155, 165, 200))
+    body = rl.Rectangle(x, body_y, _BATT_W, _BATT_H)
+    rl.draw_rectangle_rounded(body, 0.25, 6, rl.Color(38, 42, 52, 200))
+    fh = int((_BATT_H - 4) * fill)
+    if fh > 0:
+      rl.draw_rectangle(x + 2, body_y + _BATT_H - 2 - fh, _BATT_W - 4, fh, col)
+    rl.draw_rectangle_rounded_lines_ex(body, 0.25, 6, 1.5, rl.Color(150, 155, 165, 200))
+
+  def _draw_lock(self, x: int, y: int, rgb):
+    col = rl.Color(rgb[0], rgb[1], rgb[2], 235)
+    body_w, body_h = _BATT_W, 26
+    body_y = int(y + _NUB_H + _BATT_H - body_h)
+    # shackle: a half-ring sitting on the body
+    cx = x + _BATT_W / 2
+    rl.draw_ring(rl.Vector2(cx, body_y), 6.0, 9.0, 180.0, 360.0, 16, col)
+    body = rl.Rectangle(x, body_y, body_w, body_h)
+    rl.draw_rectangle_rounded(body, 0.3, 6, col)
+    rl.draw_circle(int(cx), body_y + body_h // 2, 2.5, rl.Color(20, 22, 28, 255))  # keyhole
 
   def _render(self, rect: rl.Rectangle):
     if self._st is None:
@@ -106,28 +139,15 @@ class AutoCalBars(Widget):
     y = rect.y
     x = int(rect.x)
     for band, rgb, label in (("low", _BLUE, "<30"), ("high", _RED, ">60")):
-      try:
-        fill, tick, bright = self._gauge(band)
-      except (TypeError, ValueError, KeyError):
-        continue
-      alpha = 235 if bright else 140
-      col = rl.Color(rgb[0], rgb[1], rgb[2], alpha)
-      # nub (battery cap), body outline, bottom-up fill
-      body_y = int(y + _NUB_H)
-      rl.draw_rectangle(x + (_BATT_W - _NUB_W) // 2, int(y), _NUB_W, _NUB_H,
-                        rl.Color(150, 155, 165, 200))
-      body = rl.Rectangle(x, body_y, _BATT_W, _BATT_H)
-      rl.draw_rectangle_rounded(body, 0.25, 6, rl.Color(38, 42, 52, 200))
-      fh = int((_BATT_H - 4) * fill)
-      if fh > 0:
-        rl.draw_rectangle(x + 2, body_y + _BATT_H - 2 - fh, _BATT_W - 4, fh, col)
-      rl.draw_rectangle_rounded_lines_ex(body, 0.25, 6, 1.5,
-                                         rl.Color(150, 155, 165, 200))
-      if tick is not None:
-        ty = body_y + _BATT_H - 2 - int((_BATT_H - 4) * tick)
-        rl.draw_rectangle(x - 3, ty, _BATT_W + 6, 2, rl.Color(235, 235, 240, 220))
+      if self.locked:
+        self._draw_lock(x, int(y), rgb)
+      else:
+        try:
+          self._draw_battery(x, int(y), self._fill(band), rgb)
+        except (TypeError, ValueError, KeyError):
+          pass
       rl.draw_text_ex(font, label,
                       rl.Vector2(x + (_BATT_W - _LABEL_FONT * len(label) * 0.55) / 2,
-                                 body_y + _BATT_H + _LABEL_GAP),
+                                 y + _NUB_H + _BATT_H + _LABEL_GAP),
                       _LABEL_FONT, 0, rl.Color(160, 165, 175, 210))
       y += _ROW_PITCH
