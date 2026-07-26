@@ -255,6 +255,50 @@ class LateralAngleExt:
   def bp_autocal_status(self) -> str:
     return self.autocal_ctl.status
 
+  def _feed_autocal(self, CS, kappa_cmd: float, kappa_meas: float):
+    """Build one evidence Frame from the car signals + this frame's limiter flags and hand
+    it to the controller. Frame construction (and its signal reads) happens only while the
+    calibrator is armed — for everyone else this is one attribute check per frame."""
+    if not self.autocal_ctl.enabled:
+      return
+    ws = CS.out.wheelSpeeds
+    ws_vals = (float(ws.fl), float(ws.fr), float(ws.rl), float(ws.rr))
+    self.autocal_ctl.feed(
+      Frame(v_ego=float(CS.out.vEgoRaw), kappa_cmd=kappa_cmd, kappa_meas=kappa_meas,
+            steering_pressed=bool(CS.out.steeringPressed),
+            angle_rate_limited=self.bp_angle_rate_limited,
+            deviation_limited=self.bp_curvature_deviation_limited,
+            saturated=self.bp_angle_saturated,
+            driver_torque=float(CS.out.steeringTorque), a_ego=float(CS.out.aEgo),
+            ws_spread=max(ws_vals) - min(ws_vals),
+            low_factor=self.low_speed_curv_factor, high_factor=self.high_speed_curv_factor,
+            lateral_delay=float(self.sm['liveDelay'].lateralDelay)),
+      delay_estimated=str(self.sm['liveDelay'].status) == "estimated")
+
+  def _reset_angle_signals(self, CS):
+    """Clear wire/telemetry state and the calibration + smoothing filters. Shared by the
+    three branches that drop lateral to mode 0 (inactive, human-turn, stall-blip)."""
+    self.path_angle_last = 0.0
+    self.bp_path_angle_final = 0.0
+    self.apply_curvature_last = 0.0
+    self.bp_angle_rate_limited = False
+    self.bp_curvature_rate_limited = False
+    self.bp_curvature_deviation_limited = False
+    self.sim_curvature_last = 0.0
+    # Shadow tracks measured curvature while inactive: ford.h latches it from every LKA
+    # frame, so a stale zero would fail the deviation check on the first re-engage frame.
+    self.bp_kappa_cmd = self.get_current_curvature(CS)
+    self.precision_type = 1
+    self.bp_angle_saturated = False
+    self.autocal_ctl.idle()  # steady/staged evidence must not span a lateral discontinuity
+    self.smoother.reset()
+
+  @staticmethod
+  def _inactive_result() -> LateralResult:
+    """All-zero mode-0 result the three inactive branches return."""
+    return LateralResult(apply_curvature=0.0, curvature_rate=0.0, path_offset=0.0,
+                         path_angle=0.0, ramp_type=0, precision_type=1, lateralUncertainty=0.0)
+
   def update_angle_strategy(self, CC, CS, actuators, CP):
     """
     Curvature from planner (+ optional predicted blend) → path_angle via ½·κ·d_ref.
@@ -274,22 +318,7 @@ class LateralAngleExt:
     precision = 1
 
     if not CC.latActive:
-      self.path_angle_last = 0.0
-      self.bp_path_angle_final = 0.0
-      self.apply_curvature_last = 0.0
-      self.bp_angle_rate_limited = False
-      self.bp_curvature_rate_limited = False
-      self.bp_curvature_deviation_limited = False
-      self.sim_curvature_last = 0.0
-      # Publish the shadow curvature from the measured curvature while inactive. LKA keeps
-      # carrying angle_mode_engaged whenever angle mode is configured (independent of
-      # latActive), and ford.h latches the shadow from every LKA frame -- so the latched
-      # value must track reality here, not sit at a stale zero. Otherwise the first enabled
-      # LMC frame after (re-)engage races LKA's 33Hz latch against LMC's 20Hz enable bit and
-      # ford.h's deviation check compares a zero shadow against real measured curvature.
-      # (ford.h skips the check while steer_control_enabled is 0, so the value is free to
-      # follow the measurement during the inactive period itself.)
-      self.bp_kappa_cmd = self.get_current_curvature(CS)
+      self._reset_angle_signals(CS)
       self.human_turn_detector.reset()
       self.angle_human_turn_active = False
       self.stall_blip_hold_s = 0.0
@@ -298,19 +327,7 @@ class LateralAngleExt:
       self.stall_blip_count = 0
       self.angle_stall_blip_active = False
       self.press_timer_s = 0.0
-      self.precision_type = 1
-      self.bp_angle_saturated = False
-      self.autocal_ctl.idle()  # steady-state timer and staged samples must not span disengagements
-      self.smoother.reset()
-      return LateralResult(
-        apply_curvature=0.0,
-        curvature_rate=0.0,
-        path_offset=0.0,
-        path_angle=0.0,
-        ramp_type=0,
-        precision_type=1,
-        lateralUncertainty=0.0,
-      )
+      return self._inactive_result()
 
     # Human-turn override: sustained driver press + large wheel angle → force lateral inactive
     # (carcontroller drops mode to 0; all signals are zero on the wire) so path_angle can't wind
@@ -322,41 +339,18 @@ class LateralAngleExt:
     self.angle_human_turn_active = self.human_turn_detector.update(
       True, CS.out.steeringPressed, CS.out.steeringAngleDeg)
     if self.angle_human_turn_active:
-      self.path_angle_last = 0.0
-      self.bp_path_angle_final = 0.0
-      self.apply_curvature_last = 0.0
-      self.bp_angle_rate_limited = False
-      self.bp_curvature_rate_limited = False
-      self.bp_curvature_deviation_limited = False
-      self.sim_curvature_last = 0.0
-      # Truthful shadow during the override (mirrors the inactive path -- see the comment
-      # there): the driver is steering, so the honest command is the car's actual curvature,
-      # and the panda-latched shadow stays current for the re-engage frame.
-      self.bp_kappa_cmd = self.get_current_curvature(CS)
+      self._reset_angle_signals(CS)
       # Keep exit detection current so resume doesn't compare against a stale pre-turn value.
       self._desired_curvature_last = float(actuators.curvature)
-      # A human turn ends any stall episode -- its own mode 0 does the PSCM reset job. That also
-      # covers the press so far: only press time accumulated AFTER the latch releases should earn
-      # a hand-off pulse.
+      # A human turn's own mode 0 does the PSCM reset job; only press time after the latch
+      # releases should earn a hand-off pulse, so clear the stall/press state here.
       self.stall_blip_hold_s = 0.0
       self.stall_blip_frames_left = 0
       self.stall_blip_cooldown_s = 0.0
       self.stall_blip_count = 0
       self.angle_stall_blip_active = False
       self.press_timer_s = 0.0
-      self.precision_type = 1
-      self.bp_angle_saturated = False
-      self.autocal_ctl.idle()  # steady-state timer and staged samples must not span disengagements
-      self.smoother.reset()
-      return LateralResult(
-        apply_curvature=0.0,
-        curvature_rate=0.0,
-        path_offset=0.0,
-        path_angle=0.0,
-        ramp_type=0,
-        precision_type=1,
-        lateralUncertainty=0.0,
-      )
+      return self._inactive_result()
 
     # Proactive hand-off blip: the falling edge of a sustained press earns an immediate mode-0
     # pulse (see _PRESS_BLIP_MIN_S) -- resets the PSCM's press-induced attenuation right at
@@ -378,34 +372,11 @@ class LateralAngleExt:
     if self.stall_blip_frames_left > 0:
       self.stall_blip_frames_left -= 1
       self.angle_stall_blip_active = True
-      self.path_angle_last = 0.0
-      self.bp_path_angle_final = 0.0
-      self.apply_curvature_last = 0.0
-      self.bp_angle_rate_limited = False
-      self.bp_curvature_rate_limited = False
-      self.bp_curvature_deviation_limited = False
-      self.sim_curvature_last = 0.0
-      # Truthful shadow during the blip (see the inactive-path comment).
-      self.bp_kappa_cmd = self.get_current_curvature(CS)
+      self._reset_angle_signals(CS)
       self._desired_curvature_last = float(actuators.curvature)
-      self.precision_type = 1
-      self.bp_angle_saturated = False  # published flag must not stay stale across the blip
-      # Same discontinuity handling as the disengage/human-turn branches: the blip breaks
-      # the steady-state baseline and straddles the apex buffer, so staged evidence and
-      # peak windows must not survive it.
-      self.autocal_ctl.idle()
-      self.smoother.reset()  # path ramps back from zero; filters must too
       if self.stall_blip_frames_left <= 0:
         self.stall_blip_cooldown_s = _STALL_COOLDOWN_S
-      return LateralResult(
-        apply_curvature=0.0,
-        curvature_rate=0.0,
-        path_offset=0.0,
-        path_angle=0.0,
-        ramp_type=0,
-        precision_type=1,
-        lateralUncertainty=0.0,
-      )
+      return self._inactive_result()
     self.angle_stall_blip_active = False
 
     self.precision_type = 1
@@ -658,38 +629,10 @@ class LateralAngleExt:
 
     ramp_type = 2
 
-    # BluePilot: continuous auto-calibration — the automated version of the manual method:
-    # compare requested vs actual turn (steady segments AND curve apexes), nudge the lateral
-    # tuning menu factors toward the fit in small bounded steps, back off on overshoot, and
-    # persist the evidence so it spans drives. kappa_cmd here is the exact post-clip
-    # curvature path_angle was derived from; current_curvature is the same measured value
-    # the strategy itself steers against. The pipeline stages samples for 1s (a grip or
-    # road-disturbance cancels them retroactively), holds a 3s post-grip cooldown, and
-    # rejects any frame where cmd != meas has an explanation other than gain error (bump
-    # flick, rough surface, tire-limit lat accel, longitudinal load transfer, saturation).
-    # Human-turn and stall-blip frames never reach here (their branches early-return after
-    # idling the pipeline). The controller owns the liveDelay warmup gate, nudge writes,
-    # save cadence, and the lock -> disarm transition; a returned pair is adopted as the
-    # live factors so this very frame steers with the new gain. Frame construction (and
-    # its signal reads) only happens while the calibrator is armed — for everyone else
-    # this whole block is one attribute check per frame.
-    if self.autocal_ctl.enabled:
-      ws = CS.out.wheelSpeeds
-      ws_vals = (float(ws.fl), float(ws.fr), float(ws.rl), float(ws.rr))
-      nudged = self.autocal_ctl.feed(
-        Frame(v_ego=v_ego, kappa_cmd=kappa_cmd, kappa_meas=current_curvature,
-              steering_pressed=bool(CS.out.steeringPressed),
-              angle_rate_limited=self.bp_angle_rate_limited,
-              deviation_limited=self.bp_curvature_deviation_limited,
-              saturated=self.bp_angle_saturated,
-              driver_torque=float(CS.out.steeringTorque), a_ego=float(CS.out.aEgo),
-              ws_spread=max(ws_vals) - min(ws_vals),
-              low_factor=self.low_speed_curv_factor, high_factor=self.high_speed_curv_factor,
-              lateral_delay=float(self.sm['liveDelay'].lateralDelay)),
-        delay_estimated=str(self.sm['liveDelay'].status) == "estimated")
-      if nudged is not None:
-        self.low_speed_curv_factor = float(nudged[0])
-        self.high_speed_curv_factor = float(nudged[1])
+    # Continuous auto-calibration of the speed factors (armed-only; a no-op otherwise).
+    # Nudges are written to the factor params — update_angle_params reads them back, so the
+    # factors have a single owner here. Human-turn/stall-blip frames never reach this point.
+    self._feed_autocal(CS, kappa_cmd, current_curvature)
 
     return LateralResult(
       apply_curvature=0.0,

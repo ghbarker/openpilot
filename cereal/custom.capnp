@@ -548,8 +548,8 @@ struct ControllerStateBP @0xcd96dafb67a082d0 {
   # --- Fingerprint (not a menu item, but requested alongside the settings snapshot) ---
   bmsFingerprintForced @52 :Bool;  # true when CarParams.fingerprintSource == fixed (CarPlatformBundle / FINGERPRINT env)
   bmsFingerprint @53 :Text;  # CarParams.carFingerprint
-  bmsAngleAutoCalibrate @54 :Bool;  # FordAngleAutoCal (one-time speed-factor auto-calibration)
-  bmsAngleAutoCalState @55 :Text;  # FordAngleAutoCalState ("" collecting, "done ..." locked)
+  bmsAngleAutoCalibrate @54 :Bool;  # FordAngleAutoCal toggle state
+  bmsAngleAutoCalState @55 :Text;  # live controller status (bp_autocal_status): "off"/"locked"/"reset" or armed JSON
   angleSaturated @56 :Bool;  # angle mode: PSCM authority limit or DBC clamp modified this frame's command
 }
 

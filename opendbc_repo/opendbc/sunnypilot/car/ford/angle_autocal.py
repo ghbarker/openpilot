@@ -204,6 +204,20 @@ def speed_alpha(v_ego: float) -> float:
   return (v_ego - V_LOW) / (V_HIGH - V_LOW)
 
 
+def lat_accel_margin(kappa: float, v_ego: float) -> float:
+  """Evidence weight vs lateral accel: 1.0 well below MAX_LAT_ACCEL, fading linearly to 0
+  over the last LAT_ACCEL_SOFT_BAND — near the limit cmd != meas is physics, not gain."""
+  return min(1.0, max(0.0, (MAX_LAT_ACCEL - abs(kappa) * v_ego * v_ego) / LAT_ACCEL_SOFT_BAND))
+
+
+def fit_trustworthy(weight: float, stderr_eff: float, min_weight: float) -> bool:
+  """An anchor's fit is trustworthy enough to act on: enough evidence and a tight enough
+  effective stderr. Lock, nudge and the live status share this — they differ only in the
+  weight bar and in what they do with |target - applied| afterwards. A new eligibility
+  condition (e.g. a sensor-health gate) is added here once."""
+  return weight >= min_weight and stderr_eff <= NUDGE_MAX_STDERR
+
+
 class AngleFactorEstimator:
   """Weighted least-squares fit of the two gain anchors from curve samples.
 
@@ -642,6 +656,19 @@ class SteadyStateGate:
     return self.steady_s >= STEADY_TIME_S
 
 
+@dataclass
+class _StagedSample:
+  """One holdback-staged evidence sample. Named fields (not a list-of-lists) so a
+  reordered field can't silently shift every value — they are all floats and nothing
+  would raise. age mutates as the sample waits, so this is mutable, not a NamedTuple."""
+  age: float
+  v_ego: float
+  kappa_cmd: float
+  kappa_meas: float
+  gain: float
+  weight: float
+
+
 class AutoCalPipeline:
   """Quality layer + steady gate + apex matcher + estimator + nudger + lock, driven with
   one call per 20 Hz lateral frame. Samples sit in a staging queue for PRESS_HOLDBACK_S
@@ -660,7 +687,7 @@ class AutoCalPipeline:
     self.quality = QualityMonitor(dt=dt)
     self.peaks = PeakMatcher(dt=dt)
     self.dt = dt
-    self._staged: list[list] = []  # [age_s, v, kappa_cmd, kappa_meas, applied_gain, weight]
+    self._staged: list[_StagedSample] = []
     self._meas_last = None
     self._err_lp = None            # smoothed |tracking error| for the quietness gate
     self._decay_accum = 0.0
@@ -766,8 +793,7 @@ class AutoCalPipeline:
           eligible = False
 
     # Evidence near the physical limit fades to nothing: there, cmd != meas is physics.
-    lat_accel = abs(kappa_cmd) * v_ego * v_ego
-    margin_w = min(1.0, max(0.0, (MAX_LAT_ACCEL - lat_accel) / LAT_ACCEL_SOFT_BAND))
+    margin_w = lat_accel_margin(kappa_cmd, v_ego)
     if eligible and margin_w <= 0.0:
       self.quality.counters["limit"] += 1
       eligible = False
@@ -775,24 +801,24 @@ class AutoCalPipeline:
     # Age the staging queue; entries that survived the holdback graduate to the estimator.
     committed = []
     still_staged = []
-    for entry in self._staged:
-      entry[0] += self.dt
-      if entry[0] >= PRESS_HOLDBACK_S:
-        if self.est.add_sample(entry[1], entry[2], entry[3], entry[4], weight=entry[5]):
-          committed.append((entry[1], entry[2], entry[3]))
+    for s in self._staged:
+      s.age += self.dt
+      if s.age >= PRESS_HOLDBACK_S:
+        if self.est.add_sample(s.v_ego, s.kappa_cmd, s.kappa_meas, s.gain, weight=s.weight):
+          committed.append((s.v_ego, s.kappa_cmd, s.kappa_meas))
       else:
-        still_staged.append(entry)
+        still_staged.append(s)
     self._staged = still_staged
 
     if eligible:
-      self._staged.append([0.0, v_ego, kappa_ref, kappa_meas, gain_ref, self.dt * margin_w])
+      self._staged.append(_StagedSample(0.0, v_ego, kappa_ref, kappa_meas, gain_ref, self.dt * margin_w))
 
     # Apex evidence: gated by everything EXCEPT the steadiness timer (an apex is by
     # definition not steady). Quality, grip, limit flags all poison the window —
     # the grip/flag part is the gate's own frame_clear, computed once above.
     frame_ok = q_ok and self.gate.frame_clear and margin_w > 0.0
     for (pv, pk, pm, pg) in self.peaks.push(kappa_cmd, kappa_meas, v_ego, gain_now, frame_ok):
-      p_margin = min(1.0, max(0.0, (MAX_LAT_ACCEL - abs(pk) * pv * pv) / LAT_ACCEL_SOFT_BAND))
+      p_margin = lat_accel_margin(pk, pv)
       if self.est.add_sample(pv, pk, pm, pg, weight=PEAK_WEIGHT_S * p_margin):
         committed.append((pv, pk, pm))
 
@@ -807,9 +833,10 @@ class AutoCalPipeline:
     sol = self.est.solve()
     if sol is not None:
       low_t, high_t, st = sol
-      ready = (st["weight_low"] >= LOCK_MIN_WEIGHT and st["weight_high"] >= LOCK_MIN_WEIGHT
-               and st["stderr_eff_low"] <= NUDGE_MAX_STDERR and st["stderr_eff_high"] <= NUDGE_MAX_STDERR
-               and abs(low_t - frame.low_factor) <= LOCK_DEADBAND and abs(high_t - frame.high_factor) <= LOCK_DEADBAND)
+      ready = (fit_trustworthy(st["weight_low"], st["stderr_eff_low"], LOCK_MIN_WEIGHT)
+               and fit_trustworthy(st["weight_high"], st["stderr_eff_high"], LOCK_MIN_WEIGHT)
+               and abs(low_t - frame.low_factor) <= LOCK_DEADBAND
+               and abs(high_t - frame.high_factor) <= LOCK_DEADBAND)
       if ready:
         self.stable_s += self.dt
         if self.stable_s >= LOCK_STABLE_S and self.lock_enabled:
@@ -870,7 +897,7 @@ class AutoCalPipeline:
     def step(half, target, applied, weight, stderr_eff):
       if self.verify[half] is not None:
         return None  # the last step hasn't been judged against fresh evidence yet
-      if weight < NUDGE_MIN_WEIGHT or stderr_eff > NUDGE_MAX_STDERR:
+      if not fit_trustworthy(weight, stderr_eff, NUDGE_MIN_WEIGHT):
         return None
       if self.verify_hold[half] > 0.0:
         w_rec, _ = self.est.recent_response(half)
@@ -940,8 +967,8 @@ class AutoCalPipeline:
         d["to"] = self.verify[half]["to"]
         d["vw"] = round(w_rec, 1)
         d["vneed"] = VERIFY_MIN_WEIGHT
-      elif (target is not None and weight >= NUDGE_MIN_WEIGHT
-            and stderr is not None and stderr <= NUDGE_MAX_STDERR):
+      elif (target is not None and stderr is not None
+            and fit_trustworthy(weight, stderr, NUDGE_MIN_WEIGHT)):
         if abs(target - applied) > NUDGE_DEADBAND:
           d["ph"] = "propose"
           d["t"] = round(target, 2)

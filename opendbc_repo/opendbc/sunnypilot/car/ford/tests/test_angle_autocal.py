@@ -769,7 +769,9 @@ class _MockParams:
       return self._BOOL_DEFAULTS.get(key, False)
     return bool(self.values.get(key))
 
-  def put(self, key, value):
+  def put(self, key, value, block=False):
+    # The real Params.put lands immediately when block=True; this mock always lands
+    # immediately, so both paths behave the same here (readable on the next get).
     expected = self._TYPES.get(key)
     if expected is not None and not isinstance(value, expected):
       raise TypeError(f"Type mismatch while writing param {key}: got {type(value)}, expected {expected}")
@@ -853,17 +855,24 @@ class TestOnboardGlue:
     p = _MockParams({"FordAngleAutoCal": 1, "FordAngleAutoCalState": "",
                      "FordLowSpeedFactor_ang": "1.00", "FordHighSpeedFactor_ang": "1.00"})
     ext.update_angle_params(p)
-    assert ext.autocal_ctl._apply_nudge((1.02, 1.15), (1.00, 1.00))
+    assert ext.autocal_ctl._apply_nudge((1.02, 1.15))
     # The fork's params are typed FLOAT — a string write raises and the nudge dies.
     assert p.written["FordLowSpeedFactor_ang"] == 1.02 and isinstance(p.written["FordLowSpeedFactor_ang"], float)
     assert p.written["FordHighSpeedFactor_ang"] == 1.15 and isinstance(p.written["FordHighSpeedFactor_ang"], float)
     st = json.loads(p.written["FordAngleAutoCalState"])
     assert st["phase"] == "collecting" and st["applied"] == {"low": 1.02, "high": 1.15}
-    # Our own write must NOT read back as a user edit.
+    # The blocking write landed, so it must NOT read back as a user edit. Point the strategy
+    # at the written values (the single reader) and tick: no soft-reset, evidence untouched.
+    p.values["FordLowSpeedFactor_ang"] = 1.02
+    p.values["FordHighSpeedFactor_ang"] = 1.15
+    n0 = ext.autocal_ctl.pipeline.est.n
     self._tick(ext, p, n=2)
-    assert ext.autocal_ctl.pipeline is not None and not ext.autocal_ctl._edit_pending
+    assert ext.autocal_ctl.pipeline is not None
+    assert ext.autocal_ctl.pipeline.est.n == n0  # user_edit() not triggered
 
-  def test_user_edit_adopted_after_two_ticks(self):
+  def test_user_edit_adopted_single_tick(self):
+    # Blocking nudge writes mean any param/last_written mismatch is a real driver edit —
+    # detected and adopted on ONE tick, no async-lag debounce.
     ext = self._ext()
     p = _MockParams({"FordAngleAutoCal": 1, "FordAngleAutoCalState": "",
                      "FordLowSpeedFactor_ang": "1.00", "FordHighSpeedFactor_ang": "1.00"})
@@ -871,10 +880,7 @@ class TestOnboardGlue:
     feed_plant(ext.autocal_ctl.pipeline.est, 1.05, 1.05, speeds=[10, 28], n_per_speed=200)
     w0 = ext.autocal_ctl.pipeline.est.s_w
     p.values["FordLowSpeedFactor_ang"] = "1.08"  # driver taps + in the menu
-    self._tick(ext, p, n=1)   # first tick: pending
-    assert ext.autocal_ctl._edit_pending and abs(ext.autocal_ctl.pipeline.est.s_w - w0) < 1e-9
-    self._tick(ext, p, n=1)   # second tick: confirmed
-    assert not ext.autocal_ctl._edit_pending
+    self._tick(ext, p, n=1)
     assert abs(ext.autocal_ctl.pipeline.est.s_w - 0.5 * w0) < 1e-9  # soft reset, not a wipe
     assert ext.autocal_ctl._last_written == (1.08, 1.00)
 

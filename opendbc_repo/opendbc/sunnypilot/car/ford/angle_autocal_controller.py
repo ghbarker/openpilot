@@ -1,17 +1,14 @@
 """BluePilot: lifecycle controller for the Ford angle-mode auto-calibration.
 
 AutoCalPipeline (angle_autocal.py) is pure math with no I/O. This controller owns
-everything between that math and the car: the params handle, arm/disarm from the
-FordAngleAutoCal toggle, evidence (de)serialization to FordAngleAutoCalState with
-its save cadence, user-edit debounce, nudge application to the factor params,
-error reporting to FordAngleAutoCalError, and the ground-truth telemetry status
-string. FordLateralAngleExt holds one instance and calls exactly three things:
-poll_params() at its ~1 Hz param cadence, feed() once per 20 Hz lateral frame,
-and idle() on frames where lateral is inactive.
+everything between that math and the car: arm/disarm from the toggle, evidence
+persistence to FordAngleAutoCalState, nudge writes to the factor params, errors to
+FordAngleAutoCalError, and the telemetry status string. FordLateralAngleExt calls
+poll_params() at ~1 Hz, feed() per 20 Hz lateral frame, and idle() when inactive.
 
-The controller never touches the strategy's in-memory factors — feed() returns a
-nudged (low, high) pair for the strategy to adopt, keeping the write path to the
-live steering values in exactly one place (the caller).
+Nudges are written straight to the factor params (blocking); the strategy reads them
+back through poll_params, so the live steering factors have a single owner and no
+in-memory adopt path is needed.
 """
 import json
 
@@ -57,8 +54,7 @@ class AutoCalController:
     self.pipeline = None        # AutoCalPipeline while collecting
     self.status = ""            # live ground-truth status, published in telemetry
     self._params = None
-    self._last_written = None   # (low, high) floats the nudger last wrote; edits differ
-    self._edit_pending = False  # user edit needs 2 consecutive ticks (async put lag)
+    self._last_written = None   # (low, high) the nudger last wrote; a different param value is a user edit
     self._save_s = 0.0
     self._dirty = False
 
@@ -68,12 +64,9 @@ class AutoCalController:
     factor params, refresh the status string. low/high are the currently applied values."""
     try:
       if params.get_bool("FordAngleAutoCalReset"):
-        # Erase calibration memory (settings button / any params writer): evidence, the
-        # error channel, the lock, AND the factors themselves go back to neutral — the
-        # strategy re-reads the factor params within a frame, so the car steers stock
-        # immediately and collection restarts from nothing on the next tick if the
-        # toggle is on. The UI clears the string params itself for offroad visibility;
-        # doing it again here is idempotent and covers non-UI writers.
+        # Erase calibration memory: evidence, error channel, lock and factors all go
+        # back to neutral so the car steers stock immediately and collection restarts.
+        # Idempotent with the UI's own param clears; covers non-UI writers too.
         params.put_bool("FordAngleAutoCalReset", False)
         params.put("FordAngleAutoCalState", "")
         params.put("FordAngleAutoCalError", "")
@@ -82,7 +75,6 @@ class AutoCalController:
         self.pipeline = None
         self.done = False
         self._last_written = (1.0, 1.0)
-        self._edit_pending = False
         self._dirty = False
         self._params = params
         self.status = "reset"
@@ -105,8 +97,8 @@ class AutoCalController:
         self.done = self.pipeline.locked
       self.enabled = enabled and not self.done
       if self.enabled and self.pipeline is None:
-        # Arm: build the pipeline and restore serialized evidence from a prior drive.
-        # The currently applied factors are the nudge baseline.
+        # Arm: build the pipeline, restore prior-drive evidence, baseline the nudger on
+        # the currently applied factors.
         self.pipeline = AutoCalPipeline(platform_gain_high, dt=self.dt)
         _restore(self.pipeline, state)
         self.pipeline.lock_enabled = lock_on
@@ -114,27 +106,20 @@ class AutoCalController:
           self.pipeline.locked = False  # resuming a previously locked calibration
           self.pipeline.stable_s = 0.0
         self._last_written = (float(low_factor), float(high_factor))
-        self._edit_pending = False
       elif not self.enabled:
         self.pipeline = None
       else:
-        # User-edit detection: the factor params moved without the nudger writing them.
-        # Confirmed on two consecutive ticks — an async put of our own nudge may not be
-        # readable yet on the first tick after it. The driver's judgment is adopted
-        # (values already live in the strategy); evidence is soft-reset, not wiped.
+        # User hand-edit: a factor param differs from what the nudger last wrote. The
+        # nudger's own writes are blocking (_apply_nudge), so by the time we read here
+        # they always match _last_written — any mismatch is the driver. Adopt their value
+        # (already live in the strategy) and soft-reset confidence; evidence is not wiped.
         lw = self._last_written
         moved = lw is not None and (abs(low_factor - lw[0]) > EDIT_TOL
                                     or abs(high_factor - lw[1]) > EDIT_TOL)
         if moved:
-          if self._edit_pending:
-            self.pipeline.user_edit()
-            self._last_written = (float(low_factor), float(high_factor))
-            self._edit_pending = False
-            self._dirty = True
-          else:
-            self._edit_pending = True
-        else:
-          self._edit_pending = False
+          self.pipeline.user_edit()
+          self._last_written = (float(low_factor), float(high_factor))
+          self._dirty = True
       self._params = params
       # Live status for telemetry: published from actual controller state (ground truth),
       # never from a param re-read — a param/telemetry mismatch is exactly the failure
@@ -162,26 +147,23 @@ class AutoCalController:
       self.pipeline.idle()
 
   def feed(self, frame: Frame, delay_estimated: bool):
-    """One active lateral frame. Returns a nudged (low, high) pair the strategy should
-    adopt, or None. Save cadence and the lock -> disarm transition happen here."""
+    """One active lateral frame. Nudges are written to the factor params (the strategy
+    reads them back — single reader); the lock -> disarm transition and save cadence
+    happen here."""
     if not self.enabled or self.pipeline is None:
-      return None
+      return
     if not delay_estimated:
-      # Measurement-chain warmup: kappa_meas flows through liveParameters from the same
-      # locationd stack that estimates the actuation delay — until lagd reports
-      # 'estimated' those inputs are defaults/converging. Idle (not pause): staged
-      # samples and peak windows must not straddle the unestimated period.
+      # Until lagd reports 'estimated', kappa_meas (via liveParameters, same locationd
+      # stack) is still converging — idle so staged samples don't straddle the warmup.
       self.idle()
-      return None
+      return
     committed = self.pipeline.update(frame)
     if committed:
       self._dirty = True
     applied = (frame.low_factor, frame.high_factor)
-    out = None
     rec = self.pipeline.recommend(frame.low_factor, frame.high_factor)
-    if rec is not None and self._apply_nudge(rec, applied):
+    if rec is not None and self._apply_nudge(rec):
       applied = rec
-      out = rec
     if self.pipeline.locked:
       self._save("locked", applied)
       self.done = True
@@ -191,36 +173,29 @@ class AutoCalController:
       self._save_s += self.dt
       if self._dirty and self._save_s >= SAVE_PERIOD_S:
         self._save("collecting", applied)
-    return out
 
   # -- params I/O --------------------------------------------------------------------------
-  def _apply_nudge(self, rec, applied) -> bool:
-    """Write a nudged factor pair to the params (the lateral tuning menu shows them move).
-    Returns True when the write landed — only then does the caller adopt the values.
-
-    The params are TYPED (FLOAT) in this fork: writes must be python floats — a string
-    raises TypeError. That failure mode was invisible once (swallowed except -> nudges
-    silently never landed); now any write error is recorded in FordAngleAutoCalError so
-    it shows up in the next drive's logs instead of vanishing."""
+  def _apply_nudge(self, rec) -> bool:
+    """Write a nudged factor pair to the params, blocking so the write has landed before
+    the next poll reads it (that read/write ordering is what keeps a nudge from looking
+    like a user edit — no timing guess). Returns True on success. The factor params are
+    typed FLOAT; a write error is parked in FordAngleAutoCalError rather than swallowed."""
     low_new, high_new = rec
     if self._params is None:
       return False
     try:
-      self._params.put("FordLowSpeedFactor_ang", float(low_new))
-      self._params.put("FordHighSpeedFactor_ang", float(high_new))
+      self._params.put("FordLowSpeedFactor_ang", float(low_new), True)
+      self._params.put("FordHighSpeedFactor_ang", float(high_new), True)
     except Exception as e:
       self._error(f"nudge write failed: {type(e).__name__}: {e}")
       return False
     self._last_written = (float(low_new), float(high_new))
-    self._edit_pending = False
     self._save("collecting", rec)
     return True
 
   def _error(self, msg: str):
-    """Self-reporting diagnostics: park the error in its OWN param so it is visible in
-    qlogs/initData without ever touching FordAngleAutoCalState — an error written just
-    before ignition-off must not be able to replace (and thereby erase) the serialized
-    evidence from the last good save. Never raises."""
+    """Park diagnostics in their OWN param, never FordAngleAutoCalState: an error written
+    just before ignition-off must not be able to overwrite the serialized evidence."""
     try:
       if self._params is not None:
         self._params.put("FordAngleAutoCalError", f"{msg[:300]}")
