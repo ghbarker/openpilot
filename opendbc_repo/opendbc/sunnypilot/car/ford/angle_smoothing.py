@@ -38,6 +38,12 @@ MENU_MIN = 1.0            # menu 1.0 = stock, no smoothing (bit-identical to tog
 MENU_MAX = 2.5            # strongest damping; internal strength = menu - 1.0 (0..1.5)
 
 
+def _one_pole(state: float, target: float, rc: float, dt: float) -> float:
+  """Discrete one-pole low-pass step toward target with time constant rc (rc<=0 -> passthrough)."""
+  a = dt / (rc + dt)
+  return state + a * (target - state)
+
+
 class AngleSmoother:
   """State container + per-element filters. Every method returns its input unchanged
   (and keeps its internal state seeded for a clean future enable) whenever smoothing
@@ -92,15 +98,11 @@ class AngleSmoother:
     if not self.active:
       self._pred_init = False       # a future enable re-seeds from the live value
       return predicted_curvature
-    rc = PRED_RC * self.strength
     if not self._pred_init:
       self._pred = predicted_curvature
       self._pred_init = True
-    elif rc > 1e-6:
-      a = self.dt / (rc + self.dt)
-      self._pred += a * (predicted_curvature - self._pred)
     else:
-      self._pred = predicted_curvature
+      self._pred = _one_pole(self._pred, predicted_curvature, PRED_RC * self.strength, self.dt)
     return float(self._pred)
 
   def blend(self, b_target: float) -> float:
@@ -134,8 +136,7 @@ class AngleSmoother:
       return k_abs
     rc_down = max(GAIN_RC_UP, GAIN_RC_DOWN * self.strength)
     rc = GAIN_RC_UP if k_abs > self._sched else rc_down
-    a = self.dt / (rc + self.dt)
-    self._sched += a * (k_abs - self._sched)
+    self._sched = _one_pole(self._sched, k_abs, rc, self.dt)
     return float(self._sched)
 
   def wire(self, path_angle: float) -> float:
