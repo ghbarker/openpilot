@@ -57,6 +57,11 @@ class Frame:
   low_factor: float
   high_factor: float
   lateral_delay: float  # liveDelay.lateralDelay (s) — evidence is aligned against cmd(t - delay)
+  # The one defaulted field, and the default is the neutral element: 1.0 = "no scaling",
+  # which is exactly the pre-hold-comp behavior — an omitting caller gets legacy semantics,
+  # not a wrong answer. When hold-comp scales the applied gain, the strategy passes the
+  # multiplier here so every sample records the gain ACTUALLY in force.
+  gain_scale: float = 1.0
 
 # Sample admission gates (mirrored by both the offline analyzer and the onboard hook).
 MIN_SPEED = 9.5             # m/s; below this the deviation clip is off and measurement is noisy
@@ -185,6 +190,10 @@ _NUDGE_MAX_UNITS = round(NUDGE_MAX_STEP / FACTOR_STEP)  # = 5
 VERIFY_MIN_WEIGHT = 6.0        # fresh post-step evidence (s) before the step is judged
 VERIFY_FAIL_HOLD_WEIGHT = 12.0 # a failed check demands this much evidence before stepping again
 VERIFY_OK_BAND = 0.04          # |1 - ratio| inside this after a step = success outright
+VERIFY_IMPROVE_MIN = VERIFY_OK_BAND / 2.0  # a step outside the band must improve by at least this
+                                           # much — noise-level "improvement" cannot confirm a step
+VERIFY_FAIL_EVIDENCE_SCALE = 0.5  # a failed step halves the long-memory evidence that proposed it:
+                                  # the fit's worldview mispredicted, so it re-earns its target
 TAU_RECENT_S = 90.0            # recent-response forgetting (seconds of active collection)
 
 # --- Lock --------------------------------------------------------------------------------
@@ -705,9 +714,12 @@ class AutoCalPipeline:
     self._meas_last = None
     self._err_lp = None            # smoothed |tracking error| for the quietness gate
     self._decay_accum = 0.0
-    # Lag alignment: ring of recent (kappa_cmd, applied_gain) so this frame's measurement
-    # can be ratioed against the command (and the gain in force) when it was ISSUED.
-    self._hist: list[tuple[float, float]] = []
+    # Lag alignment: ring of recent (kappa_cmd, applied_gain, clean) so this frame's
+    # measurement can be ratioed against the command (and the gain in force) when it was
+    # ISSUED — including whether THAT frame's command was limiter-contaminated: the
+    # quality flags travel with the command they describe, not with the frame that
+    # happens to consume it lag seconds later.
+    self._hist: list[tuple[float, float, bool]] = []
     self._hist_max = int(round(LAG_MAX_S / dt)) + 2
     # Nudge / lock bookkeeping (persisted).
     self.since_nudge_s = NUDGE_PERIOD_S  # first nudge allowed as soon as evidence permits
@@ -721,6 +733,9 @@ class AutoCalPipeline:
     self.verify = {0: None, 1: None}     # {"frm": factor, "to": factor, "pre_r": ratio|None}
     self.verify_result = {0: "", 1: ""}  # last judgment: "confirmed" / "failed" / ""
     self.verify_hold = {0: 0.0, 1: 0.0}  # extra fresh evidence demanded after a failure
+    self.revert_pending = {0: None, 1: None}  # failed step's frm value awaiting re-application:
+                                              # recommend() emits it so the factor WALKS BACK
+                                              # instead of parking on the unverified value
 
   # -- gain model -------------------------------------------------------------------------
   def applied_gain(self, v_ego: float, low_factor: float, high_factor: float) -> float:
@@ -745,18 +760,19 @@ class AutoCalPipeline:
     if self.locked:
       return []
     v_ego, kappa_cmd, kappa_meas = frame.v_ego, frame.kappa_cmd, frame.kappa_meas
-    gain_now = self.applied_gain(v_ego, frame.low_factor, frame.high_factor)
+    gain_now = self.applied_gain(v_ego, frame.low_factor, frame.high_factor) * frame.gain_scale
 
     # Lag alignment: this frame's MEASUREMENT answers the command from lateral_delay ago.
     # All steadiness gating and every steady-state ratio below use that reference pair
     # (cmd + the gain in force when it was issued); the apex path keeps its own explicit
     # lag matching and stays on the current command.
-    self._hist.append((kappa_cmd, gain_now))
+    ref_clean_now = not (frame.angle_rate_limited or frame.deviation_limited or frame.saturated)
+    self._hist.append((kappa_cmd, gain_now, ref_clean_now))
     if len(self._hist) > self._hist_max:
       self._hist.pop(0)
     lag_f = int(round(min(max(frame.lateral_delay, LAG_MIN_S), LAG_MAX_S) / self.dt))
     aligned = len(self._hist) > lag_f
-    kappa_ref, gain_ref = self._hist[-1 - lag_f] if aligned else (0.0, gain_now)
+    kappa_ref, gain_ref, ref_clean = self._hist[-1 - lag_f] if aligned else (0.0, gain_now, True)
 
     if aligned:
       # The gate computes grip + the per-frame admission predicate once; everything
@@ -779,7 +795,9 @@ class AutoCalPipeline:
       self._staged.clear()
       self.peaks.poison_recent(DISTURBANCE_POISON_S)
 
-    eligible = eligible and q_ok
+    # The lag-reference command must itself be clean: a clip/limiter-pinned command from
+    # lag seconds ago is not the planner's ask, however clean THIS frame looks.
+    eligible = eligible and ref_clean and q_ok
 
     # The CAR must be settled too, not just the command: during closed-loop compensation
     # swings (understeer -> harder request -> convergence tail) the command can sit steady
@@ -879,7 +897,9 @@ class AutoCalPipeline:
         continue  # keep polling — the window stays open until the data has spoken
       ok = abs(1.0 - r) <= VERIFY_OK_BAND
       if not ok and pend["pre_r"] is not None:
-        ok = abs(1.0 - r) < abs(1.0 - pend["pre_r"])
+        # Outside the band, the step must have improved by a REAL margin: the ratio is
+        # noisy at the ±0.02 level, so an any-epsilon improvement confirmed bad steps.
+        ok = (abs(1.0 - pend["pre_r"]) - abs(1.0 - r)) >= VERIFY_IMPROVE_MIN
       elif not ok:
         ok = True  # no pre-step baseline to compare against (shouldn't happen in practice)
       self.verify[half] = None
@@ -887,8 +907,14 @@ class AutoCalPipeline:
         self.verify_result[half] = "confirmed"
         self.verify_hold[half] = 0.0
       else:
+        # A failed step WALKS BACK: park the pre-step value for recommend() to re-apply,
+        # and discount the long-memory evidence that proposed it — without the discount
+        # the fit immediately re-demands the identical step after the hold, and the
+        # factor ratchets (field signature: 1.18→1.13→1.12→1.14→1.16 within one drive).
         self.verify_result[half] = "failed"
         self.verify_hold[half] = VERIFY_FAIL_HOLD_WEIGHT
+        self.revert_pending[half] = pend["frm"]
+        self.est.scale(VERIFY_FAIL_EVIDENCE_SCALE)
 
   def recommend(self, low_factor: float, high_factor: float):
     """The closed-loop step: propose nudged factor values, or None.
@@ -901,7 +927,24 @@ class AutoCalPipeline:
     loop closes: an overshoot pulls the ratios past 1, the target backs off, the next
     nudge reverses.
     """
-    if self.locked or self.since_nudge_s < NUDGE_PERIOD_S:
+    if self.locked:
+      return None
+    # A failed step's walk-back is emitted promptly (not subject to the nudge cadence):
+    # the car should not keep driving on a value that just failed its own verification.
+    if self.revert_pending[0] is not None or self.revert_pending[1] is not None:
+      out_low, out_high = round(low_factor, 2), round(high_factor, 2)
+      for half in (0, 1):
+        if self.revert_pending[half] is not None:
+          if half == 0:
+            out_low = round(float(self.revert_pending[half]), 2)
+          else:
+            out_high = round(float(self.revert_pending[half]), 2)
+          self.est.recent[half] = [0.0, 0.0]  # the hold judges post-revert evidence only
+          self.revert_pending[half] = None
+      self.since_nudge_s = 0.0
+      self.stable_s = 0.0
+      return out_low, out_high
+    if self.since_nudge_s < NUDGE_PERIOD_S:
       return None
     sol = self.est.solve()
     if sol is None:
@@ -1007,6 +1050,7 @@ class AutoCalPipeline:
       "verify": [self.verify[0], self.verify[1]],
       "verify_result": [self.verify_result[0], self.verify_result[1]],
       "verify_hold": [self.verify_hold[0], self.verify_hold[1]],
+      "revert": [self.revert_pending[0], self.revert_pending[1]],
     }
 
   def from_dict(self, d: dict):
@@ -1031,3 +1075,7 @@ class AutoCalPipeline:
     if isinstance(vh, list) and len(vh) == 2:
       for h in (0, 1):
         self.verify_hold[h] = float(vh[h])
+    rv = d.get("revert")  # a failure judged just before ignition-off still walks back
+    if isinstance(rv, list) and len(rv) == 2:
+      for h in (0, 1):
+        self.revert_pending[h] = float(rv[h]) if rv[h] is not None else None

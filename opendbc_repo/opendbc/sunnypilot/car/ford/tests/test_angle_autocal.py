@@ -14,7 +14,7 @@ from opendbc.sunnypilot.car.ford.angle_autocal import (
   SPIKE_MEAS_RATE, DISTURBANCE_BLANK_S, ROUGH_RMS_MAX, WS_SPREAD_JUMP,
   TAU_EVIDENCE_S, LR_MIN_WEIGHT, LR_TOL,
   NUDGE_PERIOD_S, NUDGE_MIN_WEIGHT, NUDGE_MAX_STEP, FACTOR_STEP, nudge_units,
-  VERIFY_MIN_WEIGHT, VERIFY_FAIL_HOLD_WEIGHT,
+  VERIFY_MIN_WEIGHT, VERIFY_FAIL_HOLD_WEIGHT, VERIFY_IMPROVE_MIN,
   LOCK_MIN_WEIGHT, LOCK_DEADBAND, LOCK_STABLE_S,
 )
 
@@ -598,22 +598,72 @@ class TestAdjustVerify:
     assert pipe.verify_result[0] == "confirmed"
     assert pipe.recommend(*rec) is not None
 
-  def test_failed_verify_holds_anchor(self):
+  def test_failed_verify_walks_back_then_holds(self):
     pipe = _evidenced_pipe(true_low=1.10, true_high=1.10)
     rec = pipe.recommend(1.0, 1.0)
     assert rec is not None and rec[0] > 1.0   # stepped UP toward the fit
+    s_w_before_fail = pipe.est.s_w
     # Contrarian car: after the step up, the measured response DROPS — the data
     # contradicts the model, so the step must not be trusted.
     _feed_low(pipe, rec, VERIFY_MIN_WEIGHT + 3.0, 1.10, 1.10, ratio_scale=0.85)
     assert pipe.verify_result[0] == "failed"
     assert pipe.verify_hold[0] == VERIFY_FAIL_HOLD_WEIGHT
-    # Kill more clock without evidence: still held (fresh weight < the fail demand).
+    # The failure WALKS BACK: the very next recommend re-applies the pre-step value
+    # (not None, not the failed value) — the car does not keep driving on a factor
+    # that just failed its own verification.
+    assert pipe.revert_pending[0] == 1.0
+    back = pipe.recommend(*rec)
+    assert back is not None and back[0] == 1.0
+    assert pipe.revert_pending[0] is None
+    assert pipe.est.recent[0] == [0.0, 0.0]   # the hold judges post-revert data only
+    # And the evidence that proposed the bad step was discounted, so the fit cannot
+    # immediately re-demand the identical move (the field ratchet signature).
+    assert pipe.est.s_w < s_w_before_fail
+    # Without fresh evidence: held.
     for _ in range(int(NUDGE_PERIOD_S / DT) + 1):
-      pipe.update(_frame(10.0, 0.0005, 0.0005, low=rec[0], high=rec[1]))
-    assert pipe.recommend(*rec) is None
+      pipe.update(_frame(10.0, 0.0005, 0.0005, low=back[0], high=back[1]))
+    assert pipe.recommend(*back) is None
     # Twice the evidence arrives and keeps asking for movement: the hold releases.
-    _feed_low(pipe, rec, VERIFY_FAIL_HOLD_WEIGHT + 4.0, 1.10, 1.10, ratio_scale=0.85)
-    assert pipe.recommend(*rec) is not None
+    _feed_low(pipe, back, VERIFY_FAIL_HOLD_WEIGHT + 4.0, 1.10, 1.10, ratio_scale=0.85)
+    assert pipe.recommend(*back) is not None
+
+  def test_noise_improvement_is_still_failure(self):
+    # A step whose post-step ratio "improves" by less than the margin is noise, not
+    # confirmation — it must fail and walk back. A real improvement confirms.
+    for improve, expect in ((VERIFY_IMPROVE_MIN * 0.4, "failed"),
+                            (VERIFY_IMPROVE_MIN * 2.5, "confirmed")):
+      pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH)
+      pre_r = 0.90
+      post_r = 1.0 - (abs(1.0 - pre_r) - improve)  # |1-post_r| = |1-pre_r| - improve
+      pipe.verify[0] = {"frm": 1.0, "to": 1.05, "pre_r": pre_r}
+      w = VERIFY_MIN_WEIGHT + 1.0
+      pipe.est.recent[0] = [w, w * post_r]
+      pipe._judge_verifies()
+      assert pipe.verify_result[0] == expect, (improve, expect, post_r)
+      assert (pipe.revert_pending[0] == 1.0) == (expect == "failed")
+
+  def test_revert_survives_persistence(self):
+    pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH)
+    pipe.revert_pending[1] = 1.12
+    fresh = AutoCalPipeline(PLATFORM_GAIN_HIGH)
+    fresh.from_dict(pipe.to_dict())
+    assert fresh.revert_pending == {0: None, 1: 1.12}
+    back = fresh.recommend(1.0, 1.16)
+    assert back is not None and back[1] == 1.12
+
+  def test_contaminated_ref_command_is_rejected(self):
+    # The quality flags must travel with the command they describe: a frame whose
+    # LAG-REFERENCE command was limiter-pinned is not evidence, however clean the
+    # current frame looks. Pattern: with lag 4 frames, flag 4-of-8 so every clean
+    # frame's reference lands on a flagged one — zero evidence may accumulate.
+    dirty = AutoCalPipeline(PLATFORM_GAIN_HIGH)
+    clean = AutoCalPipeline(PLATFORM_GAIN_HIGH)
+    n = int(30.0 / DT)
+    for i in range(n):
+      dirty.update(_frame(10.0, 0.004, 0.004, dev=(i % 8) < 4))
+      clean.update(_frame(10.0, 0.004, 0.004))
+    assert clean.est.n > 0
+    assert dirty.est.n == 0, dirty.est.n
 
   def test_lock_disabled_never_freezes(self):
     # FordAngleAutoCalLock off: stability may accumulate forever, the pipeline must not
