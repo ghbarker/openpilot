@@ -51,8 +51,10 @@ MENU_MAX = 2.5            # strongest damping; internal strength = menu - 1.0 (0
 # every entry dives (the inner-line hug) and exits carry through. This element mirrors the
 # plant's decay: the gain multiplier starts at HOLD_ENTRY_RATIO on a fresh command and
 # relaxes to 1.0, keeping delivered/requested flat across the whole curve.
-HOLD_ENTRY_RATIO = 0.82   # inverse of the measured fresh/sustained response ratio; replay-tuned
-HOLD_TAU_S = 3.0          # s — decay of the plant's fresh-response boost; replay-tuned
+HOLD_ENTRY_RATIO = 0.86   # inverse of the measured fresh/sustained response ratio; replay-tuned
+HOLD_TAU_S = 2.75         # s — decay of the plant's fresh-response boost; replay-tuned
+                          # (fit on the speed-gated regime only, 4 drives; per-drive fresh
+                          # boost ranged 0-22%, so the ratio deliberately sits mid-range)
 # Comp fades in across the gain-interp band so the knee crossing stays continuous.
 HOLD_KNEE_LO, HOLD_KNEE_HI = KAPPA_GAIN_KNEE
 
