@@ -31,11 +31,14 @@ The estimator is pure math with no I/O so the exact same code runs in two places
   - onboard, fed from lateral_angle_ext during normal driving
 """
 import math
+from collections import deque
 from dataclasses import dataclass
 from typing import NamedTuple
 
+from opendbc.car.common.filter_simple import FirstOrderFilter
+
 # The strategy owns the gain model; this module (and the offline analyzer) consume it.
-from opendbc.sunnypilot.car.ford.values_ext import V_LOW, V_HIGH, LOW_ANCHOR_BASE
+from opendbc.sunnypilot.car.ford.values_ext import V_LOW, V_HIGH, LOW_ANCHOR_BASE, KAPPA_GAIN_KNEE
 
 
 @dataclass(frozen=True)
@@ -65,7 +68,7 @@ class Frame:
 
 # Sample admission gates (mirrored by both the offline analyzer and the onboard hook).
 MIN_SPEED = 9.5             # m/s; below this the deviation clip is off and measurement is noisy
-MIN_KAPPA = 0.001           # 1/m; fully inside the high-curvature branch the factors scale
+MIN_KAPPA = KAPPA_GAIN_KNEE[1]  # 1/m; fully inside the high-curvature branch the factors scale
 # --- Lag-aligned steadiness --------------------------------------------------------------
 # The measurement lags the command by the actuation delay (liveDelay: ~0.15-0.30s typical,
 # up to ~0.42s observed). Evidence ratios are therefore taken against the command from
@@ -74,17 +77,12 @@ MIN_KAPPA = 0.001           # 1/m; fully inside the high-curvature branch the fa
 # is the DELAY ESTIMATE's own error (~±0.1s), so the bounds below only need to keep
 # kappa's fractional change over that residual small: bias ≈ tau_err * |dk/dt| / |k| —
 # at the 0.5/s relative bound and 0.1s residual, <= 5%, sign-symmetric over entries and
-# exits, inside the stderr machinery. Validated on-road 2026-07-22 (routes 0b/12/13):
-# vs the old frozen-command gate this recovers 3-5x the evidence on winding roads with
-# the pooled fit unchanged (high 1.127 before and after, stderr 0.033 -> 0.012).
+# exits, inside the stderr machinery.
 LAG_MIN_S, LAG_MAX_S = 0.10, 0.42  # trust clamp for the liveDelay estimate
 # --- Loop-quietness admission ------------------------------------------------------------
 # Steady evidence is taken only while the tracking loop is CALM: the smoothed
 # |meas - aligned cmd| error trend must be flat. Samples taken mid-excursion or
-# mid-correction carry the LOOP's dynamics, not the plant's gain — audited on-road
-# 2026-07-23: 39% of admissions were non-quiet and read up to 3% low, biasing the fit
-# ~+0.01 high ("moving the needle and calling it done"). Convergence may take as many
-# passes as calm data requires; a slower right answer beats a faster wrong one.
+# mid-correction carry the LOOP's dynamics, not the plant's gain.
 QUIET_TAU_S = 0.4           # smoothing of |tracking error| before its trend is judged
 QUIET_ERR_RATE = 0.0002     # 1/m/s: |d|err|/dt| above this = loop dynamics, no evidence
 MAX_KAPPA_RATE = 0.0015     # 1/m/s absolute floor of the admission rate bound
@@ -97,9 +95,7 @@ MAX_LAT_ACCEL = 2.5         # m/s^2; kappa*v^2 above this is tire/comfort-limit 
 # zero over the last LAT_ACCEL_SOFT_BAND m/s^2 below MAX_LAT_ACCEL.
 LAT_ACCEL_SOFT_BAND = 1.0
 # Longitudinal load transfer changes the effective lateral gain — no evidence while
-# braking/accelerating hard mid-curve. 1.0 rejected 8587 frames of ordinary city
-# braking-into-corners on the reference drive (route 00000006); 2.0 keeps those and
-# still cuts genuine hard stops (541 frames).
+# braking/accelerating hard mid-curve.
 MAX_LONG_ACCEL = 2.0        # m/s^2 |aEgo|
 
 # Driver-contamination guards. Ford flips steeringPressed at STEER_DRIVER_ALLOWANCE (1.0 Nm)
@@ -110,9 +106,9 @@ PRESS_HOLDBACK_S = 1.0      # samples are staged this long; any grip during stag
 PRESS_COOLDOWN_S = 3.0      # after any grip ends, delivery is suspect this long — no samples
 
 # --- Disturbance / road-quality rejection ------------------------------------------------
-# All four thresholds below were tuned on the 2.7 h Mach-E reference drive (route
-# 00000006--319e078ab5): tight enough to catch real disturbances, loose enough that the
-# pinion-derived measurement's normal noise floor doesn't starve the estimator.
+# All four thresholds below were tuned on the reference drive: tight enough to catch real
+# disturbances, loose enough that the pinion-derived measurement's normal noise floor
+# doesn't starve the estimator.
 # A bump, pothole, crosswind gust or passing truck flicks the car without the command
 # moving: measured curvature jumps while the command is steady. Not gain information.
 SPIKE_MEAS_RATE = 0.02      # 1/m/s measured-curvature rate with a quiet command = disturbance
@@ -141,22 +137,17 @@ PEAK_MIN_KAPPA = 0.0012     # 1/m minimum apex amplitude
 PEAK_PROMINENCE = 0.0004    # 1/m above the window minimum — rejects ripple
 PEAK_REFRACTORY_S = 1.0     # one apex per this interval
 # Apex evidence carries real transient content (the plant attenuates fast transients a bit
-# more than steady curves), so it supplements the steady evidence rather than dominating:
-# on the reference drive w=3.0 pulled the low anchor ~0.02 above the steady-only fit,
-# w=1.5 keeps the combined fit within ±0.015 of it while still covering winding roads
-# where the steady gate never fires.
+# more than steady curves), so it supplements the steady evidence rather than dominating.
 PEAK_WEIGHT_S = 1.5         # one clean apex counts like this many seconds of steady evidence
 PEAK_MEDIAN_N = 3           # apexes commit as the median of this many — kills single outliers
 
 # --- Estimator robustness ----------------------------------------------------------------
 # Forgetting: slow enough that a normal drive's evidence equilibrium (commit rate x TAU)
-# clears the lock threshold — the reference drive commits ~0.012-0.023 s/s per anchor,
-# giving equilibria of ~90-165 s — while old drives still fade within a couple of hours
-# of active collection. (An outlier gate against the running fit was tried here and
-# removed: it is path-dependent — early evidence anchors the fit, then contradicting
-# evidence gets rejected — and it visibly distorted the reference-drive fit. Robustness
-# comes from the frame quality layer, the ratio sanity bounds, staging cancellation and
-# the apex median-of-3 instead.)
+# clears the lock threshold, while old drives still fade within a couple of hours of
+# active collection. Robustness comes from the frame quality layer, the ratio sanity
+# bounds, staging cancellation and the apex median-of-3 — NOT from an outlier gate
+# against the running fit (path-dependent: early evidence would anchor the fit, then
+# contradicting evidence gets rejected).
 TAU_EVIDENCE_S = 7200.0     # evidence forgetting time constant (seconds of active collection)
 # Banked/crowned roads bias one turn direction. If the left- and right-turn estimates of an
 # anchor diverge beyond LR_TOL the divergence excess inflates that anchor's effective stderr,
@@ -178,15 +169,10 @@ NUDGE_MAX_STEP = 0.05       # max factor change per nudge
 _NUDGE_MAX_UNITS = round(NUDGE_MAX_STEP / FACTOR_STEP)  # = 5
 
 # --- Adjust-then-verify ------------------------------------------------------------------
-# 2026-07-22 design decision: the per-drive movement caps (0.10 high / 0.04 low) are GONE —
-# a genuinely miscalibrated car must be allowed to walk all the way to its fit in one
-# drive. What replaces them is an explicit check instead of a leash: every step is judged
-# against FRESH post-step evidence before its anchor may step again. The response ratio
-# (measured/commanded curvature) scales with the applied gain, so a step from g_old to
-# g_new predicts the direction the ratio must move; a fast-forgetting per-anchor ratio
-# tracker measures whether it actually did. Confirmed -> keep walking. Failed -> the data
-# contradicted the model: hold that anchor until twice the normal evidence has spoken.
-# This is the "poll a couple turns, adjust, poll some more" loop, made enforceable.
+# No per-drive movement caps: a genuinely miscalibrated car may walk all the way to its
+# fit in one drive. The check replacing them: every step is judged against FRESH post-step
+# evidence (a fast-forgetting per-anchor ratio tracker) before its anchor may step again.
+# Confirmed -> keep walking. Failed -> walk back and hold until extra evidence has spoken.
 VERIFY_MIN_WEIGHT = 6.0        # fresh post-step evidence (s) before the step is judged
 VERIFY_FAIL_HOLD_WEIGHT = 12.0 # a failed check demands this much evidence before stepping again
 VERIFY_OK_BAND = 0.04          # |1 - ratio| inside this after a step = success outright
@@ -450,8 +436,8 @@ class QualityMonitor:
     self._meas_last = None
     self._cmd_last = None
     self._ws_spread_last = None
-    self._lp = None                # low-passed measurement ("curve content")
-    self._rms2 = 0.0               # EMA of squared high-passed residual
+    self._lp = FirstOrderFilter(0.0, ROUGH_LP_TAU_S, dt, initialized=False)  # "curve content"
+    self._rms2 = FirstOrderFilter(0.0, ROUGH_RMS_TAU_S, dt)  # EMA of squared high-passed residual
     self.counters = {c: 0 for c in REJ_CAUSES}
 
   def update(self, kappa_cmd: float, kappa_meas: float,
@@ -478,14 +464,8 @@ class QualityMonitor:
 
     # Rough road: RMS of the high-passed measurement residual. The low-pass tracks curve
     # content; what remains is surface noise.
-    if self._lp is None:
-      self._lp = kappa_meas
-    alpha_lp = dt / (ROUGH_LP_TAU_S + dt)
-    self._lp += alpha_lp * (kappa_meas - self._lp)
-    resid = kappa_meas - self._lp
-    alpha_rms = dt / (ROUGH_RMS_TAU_S + dt)
-    self._rms2 += alpha_rms * (resid * resid - self._rms2)
-    rough = math.sqrt(self._rms2) > ROUGH_RMS_MAX
+    resid = kappa_meas - self._lp.update(kappa_meas)
+    rough = math.sqrt(self._rms2.update(resid * resid)) > ROUGH_RMS_MAX
 
     ok = True
     if self.blank_s > 0.0:
@@ -517,6 +497,14 @@ class _PeakFrame(NamedTuple):
   clean: bool
 
 
+class _LagFrame(NamedTuple):
+  """One slot of the lag-alignment ring — same naming rationale as _PeakFrame: all-float
+  neighbors would let a reordered field silently shift every value."""
+  kappa_cmd: float
+  gain: float
+  clean: bool
+
+
 class PeakMatcher:
   """Apex evidence — the video method. A ring buffer of recent frames; when a command
   apex (dominant, prominent local extremum with an all-clean neighborhood) scrolls to
@@ -533,7 +521,6 @@ class PeakMatcher:
     self.buf: list[_PeakFrame] = []
     self._refractory = 0
     self._pending: dict[int, list] = {0: [], 1: []}     # anchor half -> [(r, sample), ...]
-    self.apexes_seen = 0
     self.apexes_committed = 0
 
   def clear(self):
@@ -581,7 +568,6 @@ class PeakMatcher:
     if k_mag - min(mags) < PEAK_PROMINENCE:
       return []
 
-    self.apexes_seen += 1
     self._refractory = int(round(PEAK_REFRACTORY_S / self.dt))
 
     # Measured twin: same-sign extremum within the lag horizon (clean frames only).
@@ -712,15 +698,13 @@ class AutoCalPipeline:
     self.dt = dt
     self._staged: list[_StagedSample] = []
     self._meas_last = None
-    self._err_lp = None            # smoothed |tracking error| for the quietness gate
+    self._err_lp = FirstOrderFilter(0.0, QUIET_TAU_S, dt, initialized=False)  # quietness gate
     self._decay_accum = 0.0
-    # Lag alignment: ring of recent (kappa_cmd, applied_gain, clean) so this frame's
-    # measurement can be ratioed against the command (and the gain in force) when it was
-    # ISSUED — including whether THAT frame's command was limiter-contaminated: the
-    # quality flags travel with the command they describe, not with the frame that
-    # happens to consume it lag seconds later.
-    self._hist: list[tuple[float, float, bool]] = []
-    self._hist_max = int(round(LAG_MAX_S / dt)) + 2
+    # Lag alignment: ring of recent _LagFrames so this frame's measurement can be ratioed
+    # against the command (and the gain in force) when it was ISSUED — including whether
+    # THAT frame's command was limiter-contaminated: the quality flags travel with the
+    # command they describe, not with the frame that happens to consume it lag seconds later.
+    self._hist: deque[_LagFrame] = deque(maxlen=int(round(LAG_MAX_S / dt)) + 2)
     # Nudge / lock bookkeeping (persisted).
     self.since_nudge_s = NUDGE_PERIOD_S  # first nudge allowed as soon as evidence permits
     self.stable_s = 0.0
@@ -749,7 +733,7 @@ class AutoCalPipeline:
     self.peaks.clear()
     self._staged.clear()
     self._meas_last = None
-    self._err_lp = None
+    self._err_lp.initialized = False  # trend re-establishes on the next active frame
     self._hist.clear()  # commands across a discontinuity must never be an alignment target
 
   def update(self, frame: Frame) -> list:
@@ -766,13 +750,13 @@ class AutoCalPipeline:
     # All steadiness gating and every steady-state ratio below use that reference pair
     # (cmd + the gain in force when it was issued); the apex path keeps its own explicit
     # lag matching and stays on the current command.
-    ref_clean_now = not (frame.angle_rate_limited or frame.deviation_limited or frame.saturated)
-    self._hist.append((kappa_cmd, gain_now, ref_clean_now))
-    if len(self._hist) > self._hist_max:
-      self._hist.pop(0)
+    self._hist.append(_LagFrame(kappa_cmd=kappa_cmd, gain=gain_now,
+                                clean=not (frame.angle_rate_limited or frame.deviation_limited
+                                           or frame.saturated)))
     lag_f = int(round(min(max(frame.lateral_delay, LAG_MIN_S), LAG_MAX_S) / self.dt))
     aligned = len(self._hist) > lag_f
-    kappa_ref, gain_ref, ref_clean = self._hist[-1 - lag_f] if aligned else (0.0, gain_now, True)
+    ref = self._hist[-1 - lag_f] if aligned else _LagFrame(0.0, gain_now, True)
+    kappa_ref, gain_ref, ref_clean = ref.kappa_cmd, ref.gain, ref.clean
 
     if aligned:
       # The gate computes grip + the per-frame admission predicate once; everything
@@ -815,13 +799,12 @@ class AutoCalPipeline:
     # never masquerade as gain information, however long that makes a step take.
     if aligned:
       err_now = abs(kappa_meas - kappa_ref)
-      if self._err_lp is None:
-        self._err_lp = err_now
+      if not self._err_lp.initialized:
+        self._err_lp.update(err_now)
         eligible = False  # no trend established yet
       else:
-        prev = self._err_lp
-        self._err_lp += (self.dt / (QUIET_TAU_S + self.dt)) * (err_now - self._err_lp)
-        if abs(self._err_lp - prev) / self.dt > QUIET_ERR_RATE:
+        prev = self._err_lp.x
+        if abs(self._err_lp.update(err_now) - prev) / self.dt > QUIET_ERR_RATE:
           eligible = False
 
     # Evidence near the physical limit fades to nothing: there, cmd != meas is physics.
@@ -862,19 +845,24 @@ class AutoCalPipeline:
     self.since_nudge_s += self.dt
     self._judge_verifies()
 
-    sol = self.est.solve()
-    if sol is not None:
-      low_t, high_t, st = sol
-      ready = (fit_trustworthy(st["weight_low"], st["stderr_eff_low"], LOCK_MIN_WEIGHT)
-               and fit_trustworthy(st["weight_high"], st["stderr_eff_high"], LOCK_MIN_WEIGHT)
-               and abs(low_t - frame.low_factor) <= LOCK_DEADBAND
-               and abs(high_t - frame.high_factor) <= LOCK_DEADBAND)
-      if ready:
-        self.stable_s += self.dt
-        if self.stable_s >= LOCK_STABLE_S and self.lock_enabled:
-          self.locked = True
-      else:
-        self.stable_s = 0.0
+    # O(1) weight pre-check: lock is unreachable until both anchors carry LOCK_MIN_WEIGHT,
+    # so the full solve (and its stats dict) is skipped for the whole collection phase.
+    if self.est.weight_low >= LOCK_MIN_WEIGHT and self.est.weight_high >= LOCK_MIN_WEIGHT:
+      sol = self.est.solve()
+      if sol is not None:
+        low_t, high_t, st = sol
+        ready = (fit_trustworthy(st["weight_low"], st["stderr_eff_low"], LOCK_MIN_WEIGHT)
+                 and fit_trustworthy(st["weight_high"], st["stderr_eff_high"], LOCK_MIN_WEIGHT)
+                 and abs(low_t - frame.low_factor) <= LOCK_DEADBAND
+                 and abs(high_t - frame.high_factor) <= LOCK_DEADBAND)
+        if ready:
+          self.stable_s += self.dt
+          if self.stable_s >= LOCK_STABLE_S and self.lock_enabled:
+            self.locked = True
+        else:
+          self.stable_s = 0.0
+    else:
+      self.stable_s = 0.0
 
     return committed
 
@@ -939,10 +927,8 @@ class AutoCalPipeline:
             out_low = round(float(self.revert_pending[half]), 2)
           else:
             out_high = round(float(self.revert_pending[half]), 2)
-          self.est.recent[half] = [0.0, 0.0]  # the hold judges post-revert evidence only
           self.revert_pending[half] = None
-      self.since_nudge_s = 0.0
-      self.stable_s = 0.0
+          self._on_factor_changed(half)
       return out_low, out_high
     if self.since_nudge_s < NUDGE_PERIOD_S:
       return None
@@ -978,13 +964,18 @@ class AutoCalPipeline:
         _, pre_r = self.est.recent_response(half)
         self.verify[half] = {"frm": round(float(applied), 4), "to": new, "pre_r": pre_r}
         self.verify_result[half] = ""
-        self.est.recent[half] = [0.0, 0.0]
+        self._on_factor_changed(half)
     out_low = new_low if new_low is not None else round(low_factor, 2)
     out_high = new_high if new_high is not None else round(high_factor, 2)
-    self.since_nudge_s = 0.0
-    self.stable_s = 0.0
     self.nudges += 1
     return out_low, out_high
+
+  def _on_factor_changed(self, half: int):
+    """Applied-factor change (nudge or revert): fresh-response tracking restarts for that
+    anchor and the nudge/lock clocks reset — one owner for the bookkeeping both paths need."""
+    self.est.recent[half] = [0.0, 0.0]
+    self.since_nudge_s = 0.0
+    self.stable_s = 0.0
 
   def user_edit(self):
     """The driver moved a factor by hand mid-collection: their judgment is information —

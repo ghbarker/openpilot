@@ -162,3 +162,8 @@ def platform_gains(fingerprint: str) -> tuple[float, float]:
 V_LOW = 13.5
 V_HIGH = 26.82
 LOW_ANCHOR_BASE = 1.30
+# Curvature edges of the low->high gain transition (1/m). Everything keyed to the knee
+# references this pair: the strategy's gain interp, hold-comp's fade-in band, and the
+# calibrator's MIN_KAPPA evidence floor (= the top edge, so samples sit fully inside
+# the high branch the factors scale).
+KAPPA_GAIN_KNEE = (0.0007, 0.001)

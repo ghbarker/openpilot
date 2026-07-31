@@ -25,6 +25,7 @@ from openpilot.selfdrive.ui.bp.lib.dm_icon_style import (
   get_dm_icon_style,
 )
 from openpilot.selfdrive.ui.bp.lib.custom_sound import get_custom_sound_selection
+from opendbc.sunnypilot.car.ford.angle_autocal_controller import reset_autocal_params
 from opendbc.sunnypilot.car.ford.lateral_curv_ext import PrimaryLateralControl
 from openpilot.selfdrive.ui.bp.onroad.augmented_road_view_bp import GaugeStyle
 
@@ -1114,11 +1115,7 @@ class BluePilotLayout(Widget):
     1.00. The params are cleared here for immediate offroad visibility; the onroad
     controller consumes FordAngleAutoCalReset so a mid-drive erase lands within a second."""
     try:
-      self._params.put_bool("FordAngleAutoCalReset", True)
-      self._params.put("FordAngleAutoCalState", "")
-      self._params.put("FordAngleAutoCalError", "")
-      self._params.put("FordLowSpeedFactor_ang", 1.0)
-      self._params.put("FordHighSpeedFactor_ang", 1.0)
+      reset_autocal_params(self._params)
     except UnknownKeyName:
       pass
 

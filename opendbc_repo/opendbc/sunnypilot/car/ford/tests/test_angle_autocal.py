@@ -349,7 +349,7 @@ class TestAutoCalPipeline:
     assert len(pipe._staged) > 0
     pipe.idle()
     assert len(pipe._staged) == 0 and pipe.gate.steady_s == 0.0
-    assert pipe._hist == []  # alignment must never target commands across a discontinuity
+    assert len(pipe._hist) == 0  # alignment must never target commands across a discontinuity
 
   def test_unsettled_measurement_not_staged(self):
     pipe = AutoCalPipeline(PLATFORM_GAIN_HIGH)

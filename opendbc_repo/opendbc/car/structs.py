@@ -227,7 +227,7 @@ class ControllerStateBP:
   # --- Angle Tuning ---
   # NOTE: a field must be declared HERE to survive convert_to_capnp — the publisher's
   # setattr on an undeclared name is silently dropped at conversion, publishing the capnp
-  # default instead. That gap muted the auto-cal telemetry on every build until 2026-07-22.
+  # default instead.
   bmsAngleAutoCalibrate: bool = False
   bmsAngleAutoCalState: str = ""
   bmsLowSpeedAdjustmentFactor: float = 1.0

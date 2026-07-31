@@ -9,13 +9,17 @@ exact point in the command path where that element lives:
   prediction()      low-pass on the model predicted curvature (pre-blend)
   blend()           slew on the exit-blend ratio (no 4x steps from boolean chatter)
   kappa_schedule()  asymmetric filter on |kappa_cmd| feeding the gain interp — the
-                    PRIMARY fix: the 0.0007-0.001 interp band sits in straight-road
-                    noise, so unfiltered |kappa| lets the weave modulate its own loop
-                    gain every cycle (0.23 Hz limit cycle measured on route 00000006)
+                    PRIMARY fix: the interp band sits in straight-road noise, so
+                    unfiltered |kappa| lets the weave modulate its own loop gain
+                    every cycle (a measured limit cycle)
   wire()            1-LSB hold on the outgoing path_angle (kills LSB dither)
 
-Semantics: menu 1.0 = stock (strength 0.0 internally) — every method is an exact
-passthrough, bit-identical to the toggle being off. Strength scales the release
+hold_comp() rides along as a sixth, DIFFERENT kind of element: plant-gain
+compensation with its own toggle, strength-independent — co-housed for the shared
+discontinuity-reset lifecycle, not one of the smoothing filters.
+
+Semantics: menu 1.0 = stock (strength 0.0 internally) — every smoothing method is an
+exact passthrough, bit-identical to the toggle being off. Strength scales the release
 time constant, the prediction RC, and the wire-hold band; curve ENTRY behavior is
 strength-independent by design (fast-rise RC is fixed).
 
@@ -26,6 +30,8 @@ the wire hold is the whole design. Validate control changes in the closed-loop r
 """
 
 import math
+
+from opendbc.sunnypilot.car.ford.values_ext import KAPPA_GAIN_KNEE
 
 _STEER_DT = 0.05          # 20 Hz lateral cadence (mirrors lateral_angle_ext._STEER_DT)
 
@@ -40,18 +46,15 @@ MENU_MIN = 1.0            # menu 1.0 = stock, no smoothing (bit-identical to tog
 MENU_MAX = 2.5            # strongest damping; internal strength = menu - 1.0 (0..1.5)
 
 # Hold-time gain compensation (FordAngleHoldComp, its own toggle — independent of strength).
-# Measured on three drives (time-in-curve delivery medians at fixed factors): the PSCM honors
-# a FRESH curve command ~12-15% harder than one held for seconds (fresh 0-0.5 s: 1.03-1.15;
-# sustained >3 s: 0.90-0.96). A single static factor can only be right in one regime —
-# calibrated sustained-correct, every entry dives (the inner-line hug) and exits carry
-# through. This element mirrors the plant's decay so delivered/requested stays flat:
-# the gain multiplier starts at HOLD_ENTRY_RATIO on a fresh curve and relaxes to 1.0.
+# The PSCM honors a FRESH curve command ~12-15% harder than one it has held for seconds,
+# so a single static factor can only be right in one regime — calibrated sustained-correct,
+# every entry dives (the inner-line hug) and exits carry through. This element mirrors the
+# plant's decay: the gain multiplier starts at HOLD_ENTRY_RATIO on a fresh command and
+# relaxes to 1.0, keeping delivered/requested flat across the whole curve.
 HOLD_ENTRY_RATIO = 0.82   # inverse of the measured fresh/sustained response ratio; replay-tuned
 HOLD_TAU_S = 3.0          # s — decay of the plant's fresh-response boost; replay-tuned
-                          # (grid over 3 drives: 0.82/3.0 flattens the time-in-curve delivery
-                          # spread 0.460 -> 0.199; deeper/longer stops improving)
-HOLD_KNEE_LO = 0.0007     # 1/m — comp fades in across the gain-interp band (same edges as
-HOLD_KNEE_HI = 0.001      # the curvature-gain schedule, so the knee crossing stays continuous)
+# Comp fades in across the gain-interp band so the knee crossing stays continuous.
+HOLD_KNEE_LO, HOLD_KNEE_HI = KAPPA_GAIN_KNEE
 
 
 def _one_pole(state: float, target: float, rc: float, dt: float) -> float:
@@ -73,11 +76,13 @@ class AngleSmoother:
     self.hold_comp_enabled = False  # FordAngleHoldComp — its own toggle, strength-independent
     self.reset()
 
-  def configure(self, enabled: bool, menu_value: float):
+  def configure(self, enabled: bool, menu_value: float, hold_comp: bool | None = None):
     """From the params poll: menu value is clamped to [MENU_MIN, MENU_MAX]."""
     self.enabled = bool(enabled)
     menu = min(MENU_MAX, max(MENU_MIN, float(menu_value)))
     self.strength = menu - 1.0
+    if hold_comp is not None:
+      self.hold_comp_enabled = bool(hold_comp)
 
   @property
   def active(self) -> bool:

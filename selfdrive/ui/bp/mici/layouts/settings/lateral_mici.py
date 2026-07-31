@@ -6,6 +6,7 @@ from openpilot.selfdrive.ui.bp.mici.widgets.button_bp import BigButtonBP, BigPar
 from openpilot.selfdrive.ui.bp.mici.widgets.floatbutton import BigParamFloatControl, BigParamIntControl
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.widgets.scroller import NavScroller
+from opendbc.sunnypilot.car.ford.angle_autocal_controller import reset_autocal_params
 from opendbc.sunnypilot.car.ford.lateral_curv_ext import PrimaryLateralControl
 
 
@@ -21,11 +22,7 @@ class _EraseAutoCalButton(BigButtonBP):
 
   def _handle_mouse_release(self, mouse_pos):
     super()._handle_mouse_release(mouse_pos)
-    ui_state.params.put_bool("FordAngleAutoCalReset", True)
-    ui_state.params.put("FordAngleAutoCalState", "")
-    ui_state.params.put("FordAngleAutoCalError", "")
-    ui_state.params.put("FordLowSpeedFactor_ang", 1.0)
-    ui_state.params.put("FordHighSpeedFactor_ang", 1.0)
+    reset_autocal_params(ui_state.params)
 
 
 class LateralLayoutMici(NavScroller):

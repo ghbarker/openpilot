@@ -19,6 +19,19 @@ EDIT_TOL = 0.005    # half the menu granularity (0.01): a factor moved further t
                     # without the nudger writing it is a driver hand-edit
 
 
+def reset_autocal_params(params, request_onroad_reset: bool = True):
+  """The one meaning of 'erase calibration memory': evidence, error log and factors back
+  to neutral. UIs call this for immediate offroad visibility and set the reset flag so
+  the onroad controller drops its in-memory pipeline within a second; the controller
+  itself calls it with request_onroad_reset=False after consuming that flag."""
+  if request_onroad_reset:
+    params.put_bool("FordAngleAutoCalReset", True)
+  params.put("FordAngleAutoCalState", "")
+  params.put("FordAngleAutoCalError", "")
+  params.put("FordLowSpeedFactor_ang", 1.0)
+  params.put("FordHighSpeedFactor_ang", 1.0)
+
+
 def _state_locked(state: str) -> bool:
   """True when the persisted state says the calibration is finished.
   Legacy pre-JSON states ("done low=... high=... verified") stay honored."""
@@ -68,10 +81,7 @@ class AutoCalController:
         # back to neutral so the car steers stock immediately and collection restarts.
         # Idempotent with the UI's own param clears; covers non-UI writers too.
         params.put_bool("FordAngleAutoCalReset", False)
-        params.put("FordAngleAutoCalState", "")
-        params.put("FordAngleAutoCalError", "")
-        params.put("FordLowSpeedFactor_ang", 1.0)
-        params.put("FordHighSpeedFactor_ang", 1.0)
+        reset_autocal_params(params, request_onroad_reset=False)
         self.pipeline = None
         self.done = False
         self._last_written = (1.0, 1.0)

@@ -34,7 +34,8 @@ from opendbc.sunnypilot.car.ford.angle_smoothing import AngleSmoother
 from opendbc.sunnypilot.car.ford.lateral_curv_ext import LateralResult
 from opendbc.sunnypilot.car.ford.human_turn import HumanTurnDetector
 from opendbc.sunnypilot.car.ford.values_ext import (BP_ANGLE_LIMITS, platform_gains,
-                                                    V_LOW, V_HIGH, LOW_ANCHOR_BASE)
+                                                    V_LOW, V_HIGH, LOW_ANCHOR_BASE,
+                                                    KAPPA_GAIN_KNEE)
 from selfdrive.modeld.constants import ModelConstants
 
 
@@ -42,7 +43,12 @@ from selfdrive.modeld.constants import ModelConstants
 FORD_DBC_PATH_ANGLE_MIN = -0.5
 FORD_DBC_PATH_ANGLE_MAX = 0.5235
 
-# Auto-cal state persistence cadence: losing a save costs at most this much evidence.
+
+def _param_float(raw) -> float | None:
+  """bytes-or-str param payload -> float, or None when empty/absent."""
+  if raw is None or raw == b"":
+    return None
+  return float(raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw)
 
 # --- Anti-weave smoothing (FordAngleSmoothing) -------------------------------------------
 # All constants, semantics, and filter math live in angle_smoothing.AngleSmoother (pure,
@@ -209,17 +215,15 @@ class LateralAngleExt:
         ("user_dampening_factor", "FordHighSpeedDampening_ang", 0.75, 1.25),
       ):
         try:
-          raw = params.get(key, return_default=True)
-          if raw is not None and raw != b"":
-            setattr(self, attr, float(clip(
-              float(raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw), min_value, max_value)))
+          val = _param_float(params.get(key, return_default=True))
+          if val is not None:
+            setattr(self, attr, float(clip(val, min_value, max_value)))
         except Exception:
           pass
       try:
-        raw = params.get("lane_change_factor_high_ang", return_default=True)
-        if raw is not None and raw != b"":
-          self.lane_change_factor_high_ang = float(clip(
-            float(raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw), 0.85, 1.50))
+        val = _param_float(params.get("lane_change_factor_high_ang", return_default=True))
+        if val is not None:
+          self.lane_change_factor_high_ang = float(clip(val, 0.85, 1.50))
       except Exception:
         pass
       # BluePilot: auto-calibration arm/disarm (checked ~1 Hz; this method runs at 100 Hz)
@@ -228,13 +232,10 @@ class LateralAngleExt:
         self._autocal_param_ctr = 0
         try:
           _sm_enabled = bool(params.get_bool("FordAngleSmoothing"))
-          raw_strength = params.get("FordAngleSmoothStrength", return_default=True)
-          _menu = 1.0 + self.smoother.strength  # keep current on unreadable/empty
-          if raw_strength is not None and raw_strength != b"":
-            _menu = float(
-              raw_strength.decode("utf-8", errors="replace") if isinstance(raw_strength, bytes) else raw_strength)
-          self.smoother.configure(_sm_enabled, _menu)
-          self.smoother.hold_comp_enabled = bool(params.get_bool("FordAngleHoldComp"))
+          _menu = _param_float(params.get("FordAngleSmoothStrength", return_default=True))
+          if _menu is None:
+            _menu = 1.0 + self.smoother.strength  # keep current on unreadable/empty
+          self.smoother.configure(_sm_enabled, _menu, hold_comp=params.get_bool("FordAngleHoldComp"))
         except Exception:
           pass  # keep the previous values; defaults are enabled / 1.0
         self.autocal_ctl.poll_params(params, self.low_speed_curv_factor,
@@ -380,22 +381,15 @@ class LateralAngleExt:
     LP = self.lp
     desired_curvature = float(actuators.curvature)
 
-    # Variable lookup time — delay compensation is SPLIT across two horizons (2026-07-23):
+    # Variable lookup time — delay compensation is SPLIT across two horizons:
     #  - _t_entering (liveDelay capped 0.15s): the horizon for the entering/exiting DECISION
-    #    only. The cap is load-bearing for apexes: a deeper decision horizon keeps
-    #    kappa_entering True through the apex — the 0.42s-liveDelay era pathology where the
-    #    exit-biased blend never engaged and the command flat-lined at max through the apex.
-    #    A replay regression across 308 real apexes (routes 0a/0b/12/1b) showed even a
-    #    0.25s decision horizon regresses 7.5% of them, so this horizon stays short and the
-    #    apex behavior stays identical by construction.
-    #  - _t_base (liveDelay capped 0.30s): the model-prediction LEAD in the blend. The true
-    #    actuation delay is ~0.29s (liveDelay median, confirmed by command/measurement
-    #    cross-correlation on three drives); compensating only 0.15s of it left ~0.14s of
-    #    known-but-ignored delay in the loop, driving a ~0.2 Hz closed-loop breathing
-    #    (±0.5° at the wheel, in curves and straights alike — measured desired-osc 0.15,
-    #    actual-osc 0.21 mrad/m, actual trailing desired by exactly the actuation delay).
-    #    Exits stay protected regardless of this deeper lead: the exit-biased blend
-    #    collapses the prediction weight to ~15% there.
+    #    only. The short cap is load-bearing for apexes: a deeper decision horizon keeps
+    #    kappa_entering True through the apex, so the exit-biased blend never engages and
+    #    the command flat-lines at max through the apex.
+    #  - _t_base (liveDelay capped 0.30s): the model-prediction LEAD in the blend, sized to
+    #    the true actuation delay; compensating less leaves known delay in the loop and
+    #    drives a slow closed-loop breathing. Exits stay protected regardless: the
+    #    exit-biased blend collapses the prediction weight there.
     _t_entering = float(clip(self.sm['liveDelay'].lateralDelay, 0.1, 0.15)) + _DT_MDL
     _t_base = float(clip(self.sm['liveDelay'].lateralDelay, 0.1, 0.30)) + _DT_MDL
     _speed_factor = float(interp(v_ego, [_VLT_V_LOW_MS, _VLT_V_HIGH_MS], [1.0, 0.0]))
@@ -512,10 +506,8 @@ class LateralAngleExt:
 
     # As the curve grows the signal needs a boost to not understeer. The smoother's
     # asymmetric filter on |kappa| is the PRIMARY anti-weave fix (see angle_smoothing.py).
-    # COUPLING: the interp knee top (0.001) is auto-cal's MIN_KAPPA — the calibrator only
-    # samples fully inside the high branch. If this band moves, MIN_KAPPA moves with it.
     _kappa_for_gain = self.smoother.kappa_schedule(abs(kappa_cmd))
-    self.curvature_factor = interp(_kappa_for_gain, [0.0007, 0.001], [self.low_gain_calc, self.high_gain_calc])
+    self.curvature_factor = interp(_kappa_for_gain, list(KAPPA_GAIN_KNEE), [self.low_gain_calc, self.high_gain_calc])
 
     # Hold-time compensation: scales the curve gain from ~0.88 (fresh command — the PSCM
     # honors it hardest) toward 1.0 as the hold ages, mirroring the plant's own decay.
