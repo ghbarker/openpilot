@@ -14,6 +14,7 @@ from opendbc.sunnypilot.car.ford.angle_smoothing import (
   WIRE_HOLD, MENU_MIN, MENU_MAX,
   HOLD_ENTRY_RATIO, HOLD_TAU_S, HOLD_KNEE_LO, HOLD_KNEE_HI,
 )
+from opendbc.sunnypilot.car.ford.values_ext import V_LOW, V_HIGH
 
 DT = 0.05
 
@@ -168,13 +169,13 @@ class TestHoldComp:
     s = _smoother(menu=2.0)          # smoothing active — hold comp still off by default
     rng = random.Random(11)
     for _ in range(300):
-      assert s.hold_comp(rng.uniform(-0.01, 0.01)) == 1.0
+      assert s.hold_comp(rng.uniform(-0.01, 0.01), rng.uniform(0.0, 40.0)) == 1.0
 
   def test_fresh_curve_starts_at_entry_ratio(self):
     s = _smoother(menu=1.0)          # strength-independent: works at stock smoothing
     s.hold_comp_enabled = True
-    assert s.hold_comp(0.0) == 1.0                       # straight
-    m = s.hold_comp(0.003)                               # first above-knee frame
+    assert s.hold_comp(0.0, V_HIGH) == 1.0                       # straight
+    m = s.hold_comp(0.003, V_HIGH)                               # first above-knee frame
     assert abs(m - HOLD_ENTRY_RATIO) < 1e-9
 
   def test_relaxes_toward_full_gain(self):
@@ -182,34 +183,46 @@ class TestHoldComp:
     s.hold_comp_enabled = True
     m = 0.0
     for _ in range(int(3 * HOLD_TAU_S / DT)):            # hold the curve 3 tau
-      m = s.hold_comp(0.003)
+      m = s.hold_comp(0.003, V_HIGH)
     assert m > 0.99
     # monotone: never exceeds 1.0
-    assert s.hold_comp(0.003) <= 1.0
+    assert s.hold_comp(0.003, V_HIGH) <= 1.0
 
   def test_straight_and_sign_flip_restart_the_clock(self):
     s = _smoother(menu=1.0)
     s.hold_comp_enabled = True
     for _ in range(int(3 * HOLD_TAU_S / DT)):
-      s.hold_comp(0.003)
-    s.hold_comp(0.0)                                     # straight resets
-    assert abs(s.hold_comp(0.003) - HOLD_ENTRY_RATIO) < 1e-9
+      s.hold_comp(0.003, V_HIGH)
+    s.hold_comp(0.0, V_HIGH)                                     # straight resets
+    assert abs(s.hold_comp(0.003, V_HIGH) - HOLD_ENTRY_RATIO) < 1e-9
     for _ in range(int(3 * HOLD_TAU_S / DT)):
-      s.hold_comp(0.003)
-    assert abs(s.hold_comp(-0.003) - HOLD_ENTRY_RATIO) < 1e-9  # S-curve flip resets
+      s.hold_comp(0.003, V_HIGH)
+    assert abs(s.hold_comp(-0.003, V_HIGH) - HOLD_ENTRY_RATIO) < 1e-9  # S-curve flip resets
 
   def test_sub_knee_fades_to_neutral(self):
     s = _smoother(menu=1.0)
     s.hold_comp_enabled = True
     mid = 0.5 * (HOLD_KNEE_LO + HOLD_KNEE_HI)
-    m_mid = s.hold_comp(mid)                             # inside the fade band
+    m_mid = s.hold_comp(mid, V_HIGH)                             # inside the fade band
     assert HOLD_ENTRY_RATIO < m_mid < 1.0
-    assert s.hold_comp(HOLD_KNEE_LO * 0.5) == 1.0        # below the band: untouched
+    assert s.hold_comp(HOLD_KNEE_LO * 0.5, V_HIGH) == 1.0        # below the band: untouched
+
+  def test_speed_gate_protects_low_speed(self):
+    # The sag was measured at mid/high speed; sharp low-speed turns already
+    # under-deliver, so the comp must be inert below V_LOW and fade in above it.
+    s = _smoother(menu=1.0)
+    s.hold_comp_enabled = True
+    assert s.hold_comp(0.005, V_LOW * 0.5) == 1.0                # city turn: untouched
+    s.reset()
+    m_mid = s.hold_comp(0.005, 0.5 * (V_LOW + V_HIGH))           # half the fade
+    assert 1.0 - 0.5 * (1.0 - HOLD_ENTRY_RATIO) - 1e-9 <= m_mid < 1.0
+    s.reset()
+    assert abs(s.hold_comp(0.005, V_HIGH) - HOLD_ENTRY_RATIO) < 1e-9  # full at highway
 
   def test_reset_restarts_the_clock(self):
     s = _smoother(menu=1.0)
     s.hold_comp_enabled = True
     for _ in range(int(3 * HOLD_TAU_S / DT)):
-      s.hold_comp(0.003)
+      s.hold_comp(0.003, V_HIGH)
     s.reset()                                            # mode-0 discontinuity
-    assert abs(s.hold_comp(0.003) - HOLD_ENTRY_RATIO) < 1e-9
+    assert abs(s.hold_comp(0.003, V_HIGH) - HOLD_ENTRY_RATIO) < 1e-9

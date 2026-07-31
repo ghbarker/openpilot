@@ -31,7 +31,7 @@ the wire hold is the whole design. Validate control changes in the closed-loop r
 
 import math
 
-from opendbc.sunnypilot.car.ford.values_ext import KAPPA_GAIN_KNEE
+from opendbc.sunnypilot.car.ford.values_ext import KAPPA_GAIN_KNEE, V_LOW, V_HIGH
 
 _STEER_DT = 0.05          # 20 Hz lateral cadence (mirrors lateral_angle_ext._STEER_DT)
 
@@ -165,12 +165,15 @@ class AngleSmoother:
     self._sched = _one_pole(self._sched, k_abs, rc, self.dt)
     return float(self._sched)
 
-  def hold_comp(self, kappa_cmd: float) -> float:
+  def hold_comp(self, kappa_cmd: float, v_ego: float) -> float:
     """Gain multiplier for the curvature factor: HOLD_ENTRY_RATIO on a fresh curve
     command, relaxing to 1.0 with HOLD_TAU_S — the mirror of the PSCM's own decaying
     fresh-response boost, so delivered/requested stays flat across the whole curve.
     Returns exactly 1.0 when disabled or on straights; a direction flip or a straight
-    stretch restarts the clock (both present the PSCM a fresh command)."""
+    stretch restarts the clock (both present the PSCM a fresh command).
+    SPEED-GATED: the sag was measured at mid/high speed, and low-speed sharp turns
+    already under-deliver — the comp fades in over V_LOW..V_HIGH so it can never
+    soften the one regime that needs every bit of gain it has."""
     if not self.hold_comp_enabled:
       self._hold_s = 0.0
       self._hold_sign = 0.0
@@ -188,7 +191,8 @@ class AngleSmoother:
       self._hold_s += self.dt
     m = 1.0 - (1.0 - HOLD_ENTRY_RATIO) * math.exp(-self._hold_s / HOLD_TAU_S)
     w = min(1.0, max(0.0, (k - HOLD_KNEE_LO) / (HOLD_KNEE_HI - HOLD_KNEE_LO)))
-    return 1.0 - w * (1.0 - m)
+    sv = min(1.0, max(0.0, (v_ego - V_LOW) / (V_HIGH - V_LOW)))
+    return 1.0 - sv * w * (1.0 - m)
 
   def wire(self, path_angle: float) -> float:
     """Hold the outgoing wire value inside a 1-LSB band (scaled by strength).

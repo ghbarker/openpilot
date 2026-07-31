@@ -513,7 +513,7 @@ class LateralAngleExt:
     # honors it hardest) toward 1.0 as the hold ages, mirroring the plant's own decay.
     # The multiplier is recorded this frame and travels into the auto-cal Frame as
     # gain_scale so every evidence sample knows the gain ACTUALLY in force.
-    self._hold_m = self.smoother.hold_comp(kappa_cmd)
+    self._hold_m = self.smoother.hold_comp(kappa_cmd, v_ego)
     path_angle_calc = kappa_cmd * v_ego * self.curvature_factor * self._hold_m
     path_angle = path_angle_calc
 
