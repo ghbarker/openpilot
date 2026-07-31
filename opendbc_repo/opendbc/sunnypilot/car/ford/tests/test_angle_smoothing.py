@@ -12,6 +12,7 @@ import random
 from opendbc.sunnypilot.car.ford.angle_smoothing import (
   AngleSmoother, GAIN_RC_UP, GAIN_RC_DOWN, PRED_RC, ENTER_HYST, BLEND_SLEW,
   WIRE_HOLD, MENU_MIN, MENU_MAX,
+  HOLD_ENTRY_RATIO, HOLD_TAU_S, HOLD_KNEE_LO, HOLD_KNEE_HI,
 )
 
 DT = 0.05
@@ -156,3 +157,59 @@ class TestElements:
     for i in range(20):
       v = 0.0001 * i
       assert s.wire(v) == v
+
+
+class TestHoldComp:
+  """Hold-time gain compensation: mirrors the PSCM's decaying fresh-response boost so
+  one calibrated factor is right at curve entry AND on sustained sweepers. Independent
+  of the smoothing strength — its own toggle, exactly 1.0 when off."""
+
+  def test_disabled_is_exactly_one(self):
+    s = _smoother(menu=2.0)          # smoothing active — hold comp still off by default
+    rng = random.Random(11)
+    for _ in range(300):
+      assert s.hold_comp(rng.uniform(-0.01, 0.01)) == 1.0
+
+  def test_fresh_curve_starts_at_entry_ratio(self):
+    s = _smoother(menu=1.0)          # strength-independent: works at stock smoothing
+    s.hold_comp_enabled = True
+    assert s.hold_comp(0.0) == 1.0                       # straight
+    m = s.hold_comp(0.003)                               # first above-knee frame
+    assert abs(m - HOLD_ENTRY_RATIO) < 1e-9
+
+  def test_relaxes_toward_full_gain(self):
+    s = _smoother(menu=1.0)
+    s.hold_comp_enabled = True
+    m = 0.0
+    for _ in range(int(3 * HOLD_TAU_S / DT)):            # hold the curve 3 tau
+      m = s.hold_comp(0.003)
+    assert m > 0.99
+    # monotone: never exceeds 1.0
+    assert s.hold_comp(0.003) <= 1.0
+
+  def test_straight_and_sign_flip_restart_the_clock(self):
+    s = _smoother(menu=1.0)
+    s.hold_comp_enabled = True
+    for _ in range(int(3 * HOLD_TAU_S / DT)):
+      s.hold_comp(0.003)
+    s.hold_comp(0.0)                                     # straight resets
+    assert abs(s.hold_comp(0.003) - HOLD_ENTRY_RATIO) < 1e-9
+    for _ in range(int(3 * HOLD_TAU_S / DT)):
+      s.hold_comp(0.003)
+    assert abs(s.hold_comp(-0.003) - HOLD_ENTRY_RATIO) < 1e-9  # S-curve flip resets
+
+  def test_sub_knee_fades_to_neutral(self):
+    s = _smoother(menu=1.0)
+    s.hold_comp_enabled = True
+    mid = 0.5 * (HOLD_KNEE_LO + HOLD_KNEE_HI)
+    m_mid = s.hold_comp(mid)                             # inside the fade band
+    assert HOLD_ENTRY_RATIO < m_mid < 1.0
+    assert s.hold_comp(HOLD_KNEE_LO * 0.5) == 1.0        # below the band: untouched
+
+  def test_reset_restarts_the_clock(self):
+    s = _smoother(menu=1.0)
+    s.hold_comp_enabled = True
+    for _ in range(int(3 * HOLD_TAU_S / DT)):
+      s.hold_comp(0.003)
+    s.reset()                                            # mode-0 discontinuity
+    assert abs(s.hold_comp(0.003) - HOLD_ENTRY_RATIO) < 1e-9

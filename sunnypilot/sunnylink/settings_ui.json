@@ -2625,6 +2625,19 @@
           ]
         },
         {
+          "key": "FordAngleHoldComp",
+          "widget": "toggle",
+          "title": "[Lateral Tuning] Curve Hold Compensation",
+          "description": "Fixes diving into curves and carrying extra turn through exits at calibrated factors - curve gain starts slightly low on entry and relaxes to full as the curve is held, mirroring the steering module's own response decay.",
+          "visibility": [
+            {
+              "type": "param",
+              "key": "FordPrefLateralControl",
+              "equals": 1
+            }
+          ]
+        },
+        {
           "key": "lane_change_factor_high_ang",
           "widget": "option",
           "title": "[Lateral Tuning] Lane Change Factor High (Angle)",

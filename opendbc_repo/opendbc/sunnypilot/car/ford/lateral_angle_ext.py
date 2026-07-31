@@ -172,6 +172,7 @@ class LateralAngleExt:
     self._autocal_param_ctr = 100  # >= threshold so the very first call reads params (also gates smoothing reads)
     # BluePilot: anti-weave smoothing (FordAngleSmoothing; see angle_smoothing.py).
     self.smoother = AngleSmoother(dt=_STEER_DT)
+    self._hold_m = 1.0  # this frame's hold-comp gain multiplier (recorded into evidence)
     # Telemetry + autocal gate: the command this frame was modified by PSCM authority
     # limits or the DBC clamp — the car could not make the requested turn.
     self.bp_angle_saturated = False
@@ -233,6 +234,7 @@ class LateralAngleExt:
             _menu = float(
               raw_strength.decode("utf-8", errors="replace") if isinstance(raw_strength, bytes) else raw_strength)
           self.smoother.configure(_sm_enabled, _menu)
+          self.smoother.hold_comp_enabled = bool(params.get_bool("FordAngleHoldComp"))
         except Exception:
           pass  # keep the previous values; defaults are enabled / 1.0
         self.autocal_ctl.poll_params(params, self.low_speed_curv_factor,
@@ -265,7 +267,8 @@ class LateralAngleExt:
             driver_torque=float(CS.out.steeringTorque), a_ego=float(CS.out.aEgo),
             ws_spread=max(ws_vals) - min(ws_vals),
             low_factor=self.low_speed_curv_factor, high_factor=self.high_speed_curv_factor,
-            lateral_delay=float(self.sm['liveDelay'].lateralDelay)),
+            lateral_delay=float(self.sm['liveDelay'].lateralDelay),
+            gain_scale=self._hold_m),
       delay_estimated=str(self.sm['liveDelay'].status) == "estimated")
 
   def _reset_angle_signals(self, CS):
@@ -514,7 +517,12 @@ class LateralAngleExt:
     _kappa_for_gain = self.smoother.kappa_schedule(abs(kappa_cmd))
     self.curvature_factor = interp(_kappa_for_gain, [0.0007, 0.001], [self.low_gain_calc, self.high_gain_calc])
 
-    path_angle_calc = kappa_cmd * v_ego * self.curvature_factor
+    # Hold-time compensation: scales the curve gain from ~0.88 (fresh command — the PSCM
+    # honors it hardest) toward 1.0 as the hold ages, mirroring the plant's own decay.
+    # The multiplier is recorded this frame and travels into the auto-cal Frame as
+    # gain_scale so every evidence sample knows the gain ACTUALLY in force.
+    self._hold_m = self.smoother.hold_comp(kappa_cmd)
+    path_angle_calc = kappa_cmd * v_ego * self.curvature_factor * self._hold_m
     path_angle = path_angle_calc
 
 

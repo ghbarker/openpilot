@@ -25,6 +25,8 @@ the wire hold is the whole design. Validate control changes in the closed-loop r
 (bp-tools/sim/closed_loop_weave.py), not just open-loop replay.
 """
 
+import math
+
 _STEER_DT = 0.05          # 20 Hz lateral cadence (mirrors lateral_angle_ext._STEER_DT)
 
 GAIN_RC_UP = 0.10         # s — gain-schedule filter, rising |kappa| (preserves curve entry)
@@ -36,6 +38,20 @@ WIRE_HOLD = 0.0005        # rad = 1 LSB of LatCtlPath_An_Actl at strength 1.0
 
 MENU_MIN = 1.0            # menu 1.0 = stock, no smoothing (bit-identical to toggle off)
 MENU_MAX = 2.5            # strongest damping; internal strength = menu - 1.0 (0..1.5)
+
+# Hold-time gain compensation (FordAngleHoldComp, its own toggle — independent of strength).
+# Measured on three drives (time-in-curve delivery medians at fixed factors): the PSCM honors
+# a FRESH curve command ~12-15% harder than one held for seconds (fresh 0-0.5 s: 1.03-1.15;
+# sustained >3 s: 0.90-0.96). A single static factor can only be right in one regime —
+# calibrated sustained-correct, every entry dives (the inner-line hug) and exits carry
+# through. This element mirrors the plant's decay so delivered/requested stays flat:
+# the gain multiplier starts at HOLD_ENTRY_RATIO on a fresh curve and relaxes to 1.0.
+HOLD_ENTRY_RATIO = 0.82   # inverse of the measured fresh/sustained response ratio; replay-tuned
+HOLD_TAU_S = 3.0          # s — decay of the plant's fresh-response boost; replay-tuned
+                          # (grid over 3 drives: 0.82/3.0 flattens the time-in-curve delivery
+                          # spread 0.460 -> 0.199; deeper/longer stops improving)
+HOLD_KNEE_LO = 0.0007     # 1/m — comp fades in across the gain-interp band (same edges as
+HOLD_KNEE_HI = 0.001      # the curvature-gain schedule, so the knee crossing stays continuous)
 
 
 def _one_pole(state: float, target: float, rc: float, dt: float) -> float:
@@ -54,6 +70,7 @@ class AngleSmoother:
     self.dt = dt
     self.enabled = True       # master toggle (param re-read ~1 Hz by the owner)
     self.strength = 0.0       # EFFECTIVE scale (menu - 1.0); 0 = stock passthrough
+    self.hold_comp_enabled = False  # FordAngleHoldComp — its own toggle, strength-independent
     self.reset()
 
   def configure(self, enabled: bool, menu_value: float):
@@ -76,6 +93,10 @@ class AngleSmoother:
     self._b_blend = None
     self._entering = False
     self._wire = 0.0
+    # Hold-comp clock: a discontinuity (mode 0) presents the PSCM a fresh command on
+    # resume, so its fresh-response boost restarts too — resetting mirrors the plant.
+    self._hold_s = 0.0
+    self._hold_sign = 0.0
 
   # -- elements, in command-path order ------------------------------------------------------
   def entering(self, d_enter: float, raw_entering: bool) -> bool:
@@ -138,6 +159,31 @@ class AngleSmoother:
     rc = GAIN_RC_UP if k_abs > self._sched else rc_down
     self._sched = _one_pole(self._sched, k_abs, rc, self.dt)
     return float(self._sched)
+
+  def hold_comp(self, kappa_cmd: float) -> float:
+    """Gain multiplier for the curvature factor: HOLD_ENTRY_RATIO on a fresh curve
+    command, relaxing to 1.0 with HOLD_TAU_S — the mirror of the PSCM's own decaying
+    fresh-response boost, so delivered/requested stays flat across the whole curve.
+    Returns exactly 1.0 when disabled or on straights; a direction flip or a straight
+    stretch restarts the clock (both present the PSCM a fresh command)."""
+    if not self.hold_comp_enabled:
+      self._hold_s = 0.0
+      self._hold_sign = 0.0
+      return 1.0
+    k = abs(kappa_cmd)
+    if k < HOLD_KNEE_LO:
+      self._hold_s = 0.0
+      self._hold_sign = 0.0
+      return 1.0
+    sign = 1.0 if kappa_cmd > 0 else -1.0
+    if sign != self._hold_sign:
+      self._hold_s = 0.0
+      self._hold_sign = sign
+    else:
+      self._hold_s += self.dt
+    m = 1.0 - (1.0 - HOLD_ENTRY_RATIO) * math.exp(-self._hold_s / HOLD_TAU_S)
+    w = min(1.0, max(0.0, (k - HOLD_KNEE_LO) / (HOLD_KNEE_HI - HOLD_KNEE_LO)))
+    return 1.0 - w * (1.0 - m)
 
   def wire(self, path_angle: float) -> float:
     """Hold the outgoing wire value inside a 1-LSB band (scaled by strength).

@@ -81,6 +81,7 @@ class BluePilotLayout(Widget):
       ("FordAngleAutoCal", self._angle_autocal),
       ("FordAngleAutoCalLock", self._angle_autocal_lock),
       ("FordAngleSmoothing", self._angle_smoothing),
+      ("FordAngleHoldComp", self._angle_hold_comp),
       ("BPDisableLaneLineStatusColor", self._disable_lane_line_status_color),
       ("BPHideCameraView", self._hide_camera_view),
       ("BPRadRacerTheme", self._rad_racer_theme),
@@ -590,6 +591,19 @@ class BluePilotLayout(Widget):
       step=0.1,
       icon="chffr_wheel.png"
     )
+    # Hold-time gain compensation: the PSCM honors a fresh curve command harder than a
+    # sustained one, so a single factor dives at entry or sags on sweepers. This ramps
+    # the curve gain from ~0.88 to full over ~2 s to mirror the plant (angle_smoothing.py).
+    self._angle_hold_comp = toggle_item(
+      lambda: tr("Curve Hold Compensation"),
+      lambda: tr("Fixes diving into curves (hugging the inner line) and carrying extra turn "
+                 "through exits when the speed factors are calibrated: curve gain starts "
+                 "slightly low on entry and relaxes to the full calibrated value as the "
+                 "curve is held, mirroring how the car's own steering module responds."),
+      initial_state=self._safe_get_bool(self._params, "FordAngleHoldComp", default=False),
+      callback=lambda state: self._toggle_callback(state, "FordAngleHoldComp"),
+      icon="chffr_wheel.png"
+    )
     self._high_speed_dampening = float_control_item(
       lambda: tr("High Speed Low Curve Adjustment Factor"),
       lambda: tr("Tune adjustment factor for low curve straightaways (highways) at high speeds. If oversteering, reduce. If understeering, increase"),
@@ -687,6 +701,7 @@ class BluePilotLayout(Widget):
       self._angle_autocal_erase,
       self._angle_smoothing,
       self._angle_smoothing_strength,
+      self._angle_hold_comp,
       self._lane_change_factor_high_ang,
     ]
     angle_header = CollapsibleSectionHeader(tr("Angle Tuning"))
@@ -940,6 +955,7 @@ class BluePilotLayout(Widget):
     self._angle_autocal_erase.action_item.set_enabled(is_angle)
     self._angle_smoothing.action_item.set_enabled(is_angle)
     self._angle_smoothing_strength.action_item.set_enabled(is_angle)
+    self._angle_hold_comp.action_item.set_enabled(is_angle)
     self._lane_change_factor_high_ang.action_item.set_enabled(is_angle)
     # Curvature-mode items: always visible (Curvature Tuning section), greyed out when angle mode is active
     self._lane_change_factor_high_curv.action_item.set_enabled(is_curv)

@@ -65,6 +65,10 @@ class LateralLayoutMici(NavScroller):
     self.angle_smoothing_strength = BigParamFloatControl(
       "Smoothing Strength", "FordAngleSmoothStrength", min=1.0, max=2.5, step=0.1,
     )
+    # Hold-time gain compensation (see angle_smoothing.py hold_comp).
+    self.angle_hold_comp = BigParamControlBP(
+      "Curve Hold Compensation", "FordAngleHoldComp",
+    )
     self.lane_change_factor_high_ang = BigParamFloatControl(
       "Lane Change Factor High", "lane_change_factor_high_ang", min=0.85, max=1.50,
     )
@@ -118,6 +122,7 @@ class LateralLayoutMici(NavScroller):
       self.angle_autocal_erase,
       self.angle_smoothing,
       self.angle_smoothing_strength,
+      self.angle_hold_comp,
       self.lane_change_factor_high_ang,
       self.disable_lane_change_under_speed,
       self.blinker_min_speed,
@@ -138,6 +143,7 @@ class LateralLayoutMici(NavScroller):
       ("FordAngleAutoCal", self.angle_autocal),
       ("FordAngleAutoCalLock", self.angle_autocal_lock),
       ("FordAngleSmoothing", self.angle_smoothing),
+      ("FordAngleHoldComp", self.angle_hold_comp),
       ("disable_BP_lat_UI", self.disable_BP_lat),
       ("BlinkerPauseLaneChange", self.disable_lane_change_under_speed),
       ("enable_human_turn_detection_curv", self.enable_human_turn_detection),
@@ -173,6 +179,7 @@ class LateralLayoutMici(NavScroller):
     self.angle_autocal_erase.set_visible(is_angle)
     self.angle_smoothing.set_visible(is_angle)
     self.angle_smoothing_strength.set_visible(is_angle)
+    self.angle_hold_comp.set_visible(is_angle)
     self.lane_change_factor_high_ang.set_visible(is_angle)
     self.blinker_min_speed.set_enabled(ui_state.params.get_bool("BlinkerPauseLaneChange"))
     for item in (
