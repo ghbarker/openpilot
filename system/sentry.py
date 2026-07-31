@@ -1,4 +1,5 @@
 """Install exception handler for process crash."""
+import json  # BluePilot: commIssue startup-window filter
 import logging  # BluePilot: LoggingIntegration below
 import os
 import traceback
@@ -52,14 +53,65 @@ _NOISY_LOG_SUBSTRINGS = (
   # opendbc/car/car_helpers.py — routine, every boot; capture_fingerprint() above already tags
   # carFingerprint/carName on this process's scope, which is the reliable way to get fingerprint
   # context on a real crash (a tag doesn't decay out of the breadcrumb ring buffer like this would).
+  # carlog.error({...}) with a PLAIN dict -> Python's default repr -> single-quoted.
   "'event': 'fingerprinted'",
   # opendbc/car/fw_versions.py — fuzzy-match fingerprint variant of the same routine event.
   "using fuzzy match",
+  # selfdrive/selfdrived/selfdrived.py — stock/sunnypilot code logs init diagnostics via
+  # cloudlog.event(..., error=True) UNCONDITIONALLY on every successful init, healthy or not (not
+  # gated on anything actually being wrong) — fires fleet-wide on every boot forever if not filtered.
+  # NOTE: cloudlog.event(...) wraps the payload in NiceOrderedDict (common/logging_extra.py), whose
+  # __str__ is json_robust_dumps() -> real JSON, DOUBLE-quoted. This is NOT the same as a plain dict
+  # literal passed straight to .error({...}) (like the fingerprinted entry above), which renders via
+  # Python's default repr (single-quoted). Get this wrong and the entry silently never matches.
+  '"event": "selfdrived.initialized"',
+  # selfdrive/ui/lib/prime_state.py — polls comma's own api.commadotai.com every 5s on a background
+  # thread, broadly caught (no crash, retries automatically) — a transient network hiccup, not a bug.
+  # Matches the stable prefix only; the exception text after it varies by failure type (timeout, DNS,
+  # connection refused, ...). Plain f-string, no NiceOrderedDict/JSON quoting concern here.
+  "Failed to fetch prime status:",
 )
+
+# BluePilot: daemons whose code we never touch (verified: no "# BluePilot:" markers in either file
+# at the time this was added). Errors there are upstream comma/openpilot issues, not ours to fix —
+# comma's own fleet-scale telemetry is the right place for that signal, not our GlitchTip. Filters
+# the WHOLE daemon regardless of message content, unlike the precise per-line _NOISY_LOG_SUBSTRINGS
+# above. Re-verify with `grep -rn BluePilot <file>` before adding another daemon here — this is a
+# blind spot by design: a genuinely new/severe bug in a listed daemon would go unreported too.
+_UPSTREAM_ONLY_DAEMONS = (
+  "deleter",
+  "uploader",
+  "hardwared",
+)
+
+# BluePilot: commIssue (selfdrive/selfdrived/selfdrived.py) is a REAL driver-facing alert (soft-
+# disable + no-entry, "Communication Issue Between Processes") — unlike everything else filtered
+# above, it's not always benign, so it does NOT get a blanket substring/daemon filter. Instead:
+# transient ones in the first ~20s after process start (peripheral streams like modelV2/
+# liveCalibration/liveDelay still catching up — the common case seen in practice) are filtered;
+# anything after that window is presumed a genuine mid-drive regression and left alone. Relies on
+# a 'dt' field BP added to that specific log call (see selfdrived.py) — older commIssue messages
+# without it (e.g. a device that hasn't updated yet) are NOT filtered, the safe default.
+_COMM_ISSUE_STARTUP_WINDOW_S = 20.0
+
+
+def _is_startup_comm_issue(formatted: str) -> bool:
+  if '"event": "commIssue"' not in formatted:
+    return False
+  try:
+    payload = json.loads(formatted)
+  except (json.JSONDecodeError, ValueError):
+    return False
+  dt = payload.get("dt")
+  return isinstance(dt, (int, float)) and dt < _COMM_ISSUE_STARTUP_WINDOW_S
 
 
 def _before_send(event: dict, hint: dict) -> dict | None:
+  if event.get("tags", {}).get("daemon") in _UPSTREAM_ONLY_DAEMONS:
+    return None
   formatted = event.get("logentry", {}).get("formatted", "")
+  if _is_startup_comm_issue(formatted):
+    return None
   if any(s in formatted for s in _NOISY_LOG_SUBSTRINGS):
     return None
   return event
